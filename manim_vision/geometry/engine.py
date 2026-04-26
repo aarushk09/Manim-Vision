@@ -15,6 +15,7 @@ from shapely import errors as shapely_errors
 
 from manim_vision.exceptions import ManimVisionGeometryError
 from manim_vision.geometry.adapter import GeometryAdapter
+from manim_vision.geometry.registration import iter_trackable_family_members
 
 if TYPE_CHECKING:
     from manim.mobject.types.vectorized_mobject import VMobject
@@ -136,16 +137,12 @@ class PrecisionGeometryEngine:
         :meth:`update` / :meth:`register` can be called from the same thread while the
         worker holds the main scene lock.
         """
-        from manim.mobject.types.vectorized_mobject import VMobject
-
         for root in list(scene_roots):
-            for m in root.get_family():
-                if not isinstance(m, VMobject):
-                    continue
-                if id(m) in self._registry:
-                    self.update(m)
+            for member in iter_trackable_family_members(root):
+                if id(member) in self._registry:
+                    self.update(member)
                 else:
-                    self.register(m)
+                    self.register(member)
 
     def check_collisions(self) -> list[CollisionResult]:
         """Run broad-phase STRtree queries and narrow-phase DE-9IM-backed overlap tests.

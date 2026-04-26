@@ -16,12 +16,9 @@ from manim_vision.geometry.registration import (
     register_mobject_families_in_engine,
 )
 from manim_vision.semantic import (
-    is_intentional_layout_pair,
-    is_pair_internal_glyphs_same_text,
+    SceneSemanticResolver,
     min_reportable_overlap_area,
     per_pair_jsonl_enabled,
-    semantic_label,
-    stable_pair_key,
 )
 from manim_vision.solver.constraint import ConstraintSolver
 from manim_vision.telemetry.dispatcher import TelemetryDispatcher
@@ -43,13 +40,16 @@ def _execute_collision_check(scene: Any) -> None:
     solver = getattr(scene, "_self_solver")
     dispatcher = getattr(scene, "_self_dispatcher")
     scene_name = getattr(scene, "_manim_vision_scene_class_name")
+    active_events: set[tuple[int, int]] = getattr(scene, "_self_active_collision_events")
 
     with lock:
         # Animations only move submobject points; scene.mobjects’ families must be
         # re-baked to Shapely before testing pairs.
         engine.resync_scene_mobjects(list(scene.mobjects))
         raw_hits = engine.check_collisions()
+        resolver = SceneSemanticResolver(scene)
         if not raw_hits:
+            active_events.clear()
             return
 
         min_a = min_reportable_overlap_area()
@@ -63,10 +63,10 @@ def _execute_collision_check(scene: Any) -> None:
                 continue
             m_a = engine._registry[cr.mobject_a_id][0]
             m_b = engine._registry[cr.mobject_b_id][0]
-            if is_pair_internal_glyphs_same_text(m_a, m_b, scene):
+            if resolver.is_pair_internal_glyphs_same_text(m_a, m_b):
                 n_glyphs += 1
                 continue
-            if is_intentional_layout_pair(m_a, m_b, scene):
+            if resolver.is_intentional_layout_pair(m_a, m_b):
                 n_intent += 1
                 continue
             work.append(cr)
@@ -78,46 +78,38 @@ def _execute_collision_check(scene: Any) -> None:
         }
 
         if not work:
-            dispatcher.write_check_digest(
-                {
-                    "kind": "manim_vision_check_v1",
-                    "scene_name": scene_name,
-                    "raw_pair_hits": len(raw_hits),
-                    "suppressed": suppressed,
-                    "actionable_merged": [],
-                    "note": "all overlaps in this check were treated as non-actionable (noise, nested layout, or number-in-tile).",
-                }
-            )
-            logger.info(
-                "Manim Vision: spatial check for %s — 0 actionable after filters "
-                "(raw=%d, suppressed %r).",
-                scene_name,
-                len(raw_hits),
-                suppressed,
-            )
+            active_events.clear()
             return
 
         solver.apply_force_relaxation(work)
 
-        clusters: dict[str, list[CollisionResult]] = {}
+        clusters: dict[tuple[int, int], list[CollisionResult]] = {}
         for cr in work:
             m_a = engine._registry[cr.mobject_a_id][0]
             m_b = engine._registry[cr.mobject_b_id][0]
-            k = stable_pair_key(semantic_label(m_a, scene), semantic_label(m_b, scene))
-            clusters.setdefault(k, []).append(cr)
+            event_key = resolver.event_key(m_a, m_b)
+            clusters.setdefault(event_key, []).append(cr)
+
+        current_events = set(clusters)
+        new_events = current_events - active_events
+        active_events.clear()
+        active_events.update(current_events)
+        if not new_events:
+            return
 
         per_pair = per_pair_jsonl_enabled()
         n_new = 0
         n_duped = 0
         actionable: list[dict[str, Any]] = []
 
-        for _key, group in clusters.items():
+        for event_key in sorted(new_events):
+            group = clusters[event_key]
             best = max(group, key=lambda c: c.overlap_area)
             m_a = engine._registry[best.mobject_a_id][0]
             m_b = engine._registry[best.mobject_b_id][0]
             mtv = solver.calculate_mtv(best)
             fix_syntax = solver.generate_fix_syntax(mtv)
-            la, lb = semantic_label(m_a, scene), semantic_label(m_b, scene)
+            la, lb = resolver.pair_labels(m_a, m_b)
             if per_pair:
                 out = dispatcher.dispatch(
                     best,
@@ -148,6 +140,7 @@ def _execute_collision_check(scene: Any) -> None:
             {
                 "kind": "manim_vision_check_v1",
                 "scene_name": scene_name,
+                "new_event_count": len(actionable),
                 "raw_pair_hits": len(raw_hits),
                 "suppressed": suppressed,
                 "actionable_merged": actionable,
@@ -157,7 +150,7 @@ def _execute_collision_check(scene: Any) -> None:
         n_action = len(actionable)
         if per_pair and n_new:
             logger.info(
-                "Manim Vision: %d new per-pair JSONL line(s) for %s (digest merged %d pair label(s) from %d raw; "
+                "Manim Vision: %d new per-pair event(s) for %s (digest merged %d pair label(s) from %d raw; "
                 "raw=%d, suppressed %r).",
                 n_new,
                 scene_name,
@@ -168,7 +161,7 @@ def _execute_collision_check(scene: Any) -> None:
             )
         elif n_action and not per_pair:
             logger.info(
-                "Manim Vision: digest only — %d actionable group(s) for %s "
+                "Manim Vision: digest only — %d new actionable event(s) for %s "
                 "(set MANIM_VISION_PER_PAIR_JSONL=1 for legacy one-line-per-pair; raw=%d, suppressed %r).",
                 n_action,
                 scene_name,
@@ -193,7 +186,7 @@ def _submit_collision_check(scene: Any) -> None:
     executor.submit(scene._run_collision_check)
 
 
-def _create_manim_vision_runtime_attrs(scene_name: str) -> dict[str, Any]:
+def _create_manim_vision_runtime_attrs(scene_name: str, output_mode: str = "llm") -> dict[str, Any]:
     """Build shared runtime objects for scene instrumentation.
 
     Args:
@@ -205,7 +198,7 @@ def _create_manim_vision_runtime_attrs(scene_name: str) -> dict[str, Any]:
     lock = threading.RLock()
     engine = PrecisionGeometryEngine(registry_lock=lock)
     solver = ConstraintSolver()
-    dispatcher = TelemetryDispatcher(scene_name=scene_name)
+    dispatcher = TelemetryDispatcher(scene_name=scene_name, output_mode=output_mode)
     executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="manim-vision-collision")
     return {
         "_self_engine": engine,
@@ -213,6 +206,7 @@ def _create_manim_vision_runtime_attrs(scene_name: str) -> dict[str, Any]:
         "_self_dispatcher": dispatcher,
         "_self_lock": lock,
         "_self_executor": executor,
+        "_self_active_collision_events": set(),
         "_manim_vision_scene_class_name": scene_name,
     }
 

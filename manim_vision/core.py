@@ -15,7 +15,7 @@ class ManimVision:
     """Activate Manim Vision spatial monitoring on a running Manim :class:`~manim.scene.scene.Scene`."""
 
     @classmethod
-    def monitor(cls, scene: Any) -> Any:
+    def monitor(cls, scene: Any, output_mode: str = "llm") -> Any:
         """Instrument ``scene`` so ``add`` / ``play`` / ``remove`` run collision analysis.
 
         ``ManimVision.monitor(self)`` does not replace the ``self`` reference in the caller's
@@ -32,6 +32,9 @@ class ManimVision:
 
         Args:
             scene: The live ``Scene`` instance (typically ``self`` inside ``construct``).
+            output_mode: ``"llm"`` for compact scene summaries, ``"human"`` for readable
+                summaries, or ``"silent"`` to suppress file/stdout output while keeping
+                results available programmatically.
 
         Returns:
             The same ``scene`` instance, now with Manim Vision hooks installed.
@@ -47,7 +50,7 @@ class ManimVision:
         orig_cls = type(scene)
         user_scene_name = orig_cls.__name__
 
-        for attr_name, attr_value in _create_manim_vision_runtime_attrs(user_scene_name).items():
+        for attr_name, attr_value in _create_manim_vision_runtime_attrs(user_scene_name, output_mode).items():
             object.__setattr__(scene, attr_name, attr_value)
 
         merged = type(
@@ -83,3 +86,11 @@ class ManimVision:
         dispatcher = scene.__dict__.get("_self_dispatcher")
         if dispatcher is not None and hasattr(dispatcher, "close"):
             dispatcher.close()
+
+    @classmethod
+    def results(cls, scene: Any) -> dict[str, Any] | None:
+        """Return the most recent scene summary accumulated by the dispatcher."""
+        dispatcher = scene.__dict__.get("_self_dispatcher")
+        if dispatcher is None:
+            return None
+        return getattr(dispatcher, "results", None)

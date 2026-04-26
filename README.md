@@ -1,6 +1,6 @@
 # Manim Vision
 
-**Manim Vision** adds production-oriented **2D spatial collision awareness** to [Manim Community](https://www.manim.community/) scenes. It tracks `VMobject` geometry in the background, detects overlaps with [Shapely](https://shapely.readthedocs.io/) and a **STRtree** broad phase, and emits **JSON “spatial health” reports** (with suggested `shift(...)` fix strings) to help you find unintentional object overlap while you build animations.
+**Manim Vision** adds spatial collision awareness to [Manim Community](https://www.manim.community/) scenes. It watches your scene as `add`, `play`, and `remove` run, detects meaningful overlaps, and emits compact summaries that an LLM can use to fix layout problems without reading video frames.
 
 |            | |
 |------------|---|
@@ -8,35 +8,14 @@
 | **Python** | 3.10, 3.11, or 3.12 |
 | **License**| MIT |
 
----
-
-## Table of contents
-
-- [What it does](#what-it-does)
-- [Installation](#installation)
-- [Quick start](#quick-start)
-- [Shutting down cleanly](#shutting-down-cleanly)
-- [How it works (architecture)](#how-it-works-architecture)
-- [Telemetry output](#telemetry-output)
-- [Public API and exceptions](#public-api-and-exceptions)
-- [Design notes and limitations](#design-notes-and-limitations)
-- [Development](#development)
-- [License](#license)
-
----
-
 ## What it does
 
-- **Hooks** your live `Scene` so **`add`**, **`play`**, and **`remove`** participate in a collision pipeline (via a dynamically merged mixin; your scene class is unchanged at import time).
-- **Tracks every visible leaf** `VMobject` in the **mobject family** of each `add()` call (e.g. each `Square` and `Text` inside a `VGroup` — not only the group’s root), then refreshes that geometry from live point data after each **`play`**, so overlaps between siblings (arrow vs cell, two boxes, label vs shape, …) are seen by the 2D engine.
-- **Wraps** each *root* mobject in `add` with a transparent **proxy** that refreshes stored geometry when you call common **spatial** methods on the root only (`shift`, `scale`, `rotate`, `move_to`, `next_to`, `align_to`, `set_x` / `set_y` / `set_z`, `stretch`, `apply_matrix`, `apply_function`); submobject motion is still captured in the per-`play` resync.
-- **Detects** pairwise overlaps using **Shapely** (narrow phase, with DE-9IM / intersection area) on top of a **Shapely STRtree** for broad phase.
-- **Relaxes** overlapping pairs with an internal **force-based iteration** and computes **MTV-style** separation hints (`ConstraintSolver`).
-- **Emits** a **check digest** (one JSON per `play` by default) to `media/manim_vision/<SceneName>_check_digest.jsonl`, with optional **per-collision** Schema-validated JSONL when you set `MANIM_VISION_PER_PAIR_JSONL=1` (see [Telemetry output](#telemetry-output)).
-
-Collision work runs on a **dedicated single-worker thread pool** so the main animation thread is not blocked by geometry queries.
-
----
+- Hooks a live `Scene` without changing your source class at import time.
+- Converts tracked `VMobject` geometry to Shapely shapes and checks overlap with an `STRtree`.
+- Suppresses obvious noise such as glyph-on-glyph kerning, centered text-in-cell layouts, and tiny dust overlaps.
+- Tracks overlap *events*, so a collision that persists for 100 plays is reported once until the objects separate.
+- Labels collisions with scene-meaningful names instead of raw memory ids.
+- Produces a compact scene summary by default, with optional human-readable or silent modes.
 
 ## Installation
 
@@ -44,144 +23,95 @@ Collision work runs on a **dedicated single-worker thread pool** so the main ani
 pip install manim-vision
 ```
 
-Dependencies are declared in `pyproject.toml` and include at least: `manim`, `shapely`, `wrapt`, `numpy`, and `jsonschema`.
-
----
+Dependencies are declared in `pyproject.toml` and include `manim`, `shapely`, `wrapt`, `numpy`, and `jsonschema`.
 
 ## Quick start
 
-Call `ManimVision.monitor(self)` **early** in `construct()` (after you have a real `Scene` instance). Use your scene as usual: `add`, `play`, and `remove` are instrumented automatically.
+Call `ManimVision.monitor(self)` early in `construct()`, then shut it down at the end so queued collision work can flush.
 
 ```python
-from manim import BLUE, RED, Create, Circle, Scene, Square
+from manim import BLUE, RED, Create, Circle, RIGHT, Scene, Square
 from manim_vision import ManimVision
 
 
 class MyScene(Scene):
     def construct(self):
-        ManimVision.monitor(self)
+        ManimVision.monitor(self)  # default: compact LLM summary
 
-        a = Circle(radius=1, color=BLUE)
-        b = Square(side_length=1.2, color=RED)
-        b.next_to(a, RIGHT, buff=0)  # may overlap — reported if so
+        circle = Circle(radius=1, color=BLUE)
+        square = Square(side_length=1.2, color=RED)
+        square.next_to(circle, RIGHT, buff=0)
 
-        self.add(a, b)
-        self.play(Create(a), Create(b))
+        self.add(circle, square)
+        self.play(Create(circle), Create(square))
 
-        ManimVision.shutdown(self)  # recommended: see below
+        ManimVision.shutdown(self)
+        print(ManimVision.results(self))
 ```
 
-**Lazy import:** `manim_vision` loads lightweight symbols (`ManimVisionError`, etc.) immediately; `ManimVision` is loaded from `manim_vision.core` the first time you access it, so imports stay cheap when Manim is not yet needed.
+## Output modes
 
----
+`ManimVision.monitor(scene, output_mode=...)` accepts one optional mode:
 
-## Shutting down cleanly
+- `"llm"`: default. Collects collision events during the scene and writes one compact JSON summary at shutdown to `media/manim_vision/<SceneName>_check_digest.jsonl`.
+- `"human"`: collects the same events but writes a readable text summary for developers.
+- `"silent"`: writes nothing to disk or stdout and keeps results available through `ManimVision.results(scene)`.
 
-`ManimVision.shutdown(self)` (or the mixin’s `shutdown()` on the scene) **waits for queued collision jobs** and **shuts down the worker thread pool** before the scene / process tears down. Use it at the end of `construct()` or after your last `add` / `play` in long or scripted runs to avoid pending work or pool warnings at exit.
+Example:
 
----
+```python
+ManimVision.monitor(self, output_mode="silent")
+# ...
+ManimVision.shutdown(self)
+summary = ManimVision.results(self)
+```
 
-## How it works (architecture)
+## Output files
 
-1. **`ManimVision.monitor(scene)`** checks that `scene` is a Manim `Scene`, then attaches an engine, solver, telemetry dispatcher, **registry lock**, and **executor** to the instance. It rebases `scene.__class__` to a new type that **prepends** `ManimVisionSceneMixin` in the MRO so `add` / `play` / `remove` are overridden while the rest of your class behaves as before.
-2. **`add`** wraps each `VMobject` in a **`ManimVisionMobjectProxy`**, which **registers** it with `PrecisionGeometryEngine` and **updates** geometry after spatial mutators.
-3. After `add` and `play`, a collision check is **submitted** to the executor. Under the scene lock, the engine **checks collisions**, the solver **applies relaxation** and **MTV** math, and the **TelemetryDispatcher** writes **JSON** to the configured stream (default **stdout**).
-4. **`remove`** deregisters mobjects from the engine’s registry.
+By default, Manim Vision writes under your Manim media directory:
 
-Internal pieces (for reading the code or building on top of the library):
+- `media/manim_vision/<SceneName>_check_digest.jsonl`: compact scene summary in LLM mode.
+- `media/manim_vision/<SceneName>_spatial_log.txt`: human summary in human mode.
+- `media/manim_vision/<SceneName>_spatial.jsonl`: legacy per-event JSONL, only when `MANIM_VISION_PER_PAIR_JSONL=1`.
 
-| Component | Role |
-|-----------|------|
-| `GeometryAdapter` | Converts `VMobject` outlines to Shapely geometry (with validation / error handling). |
-| `PrecisionGeometryEngine` | Registry, `STRtree` queries, `CollisionResult` build-out. |
-| `ConstraintSolver` | MTV / SAT-style hints, force relaxation, `shift(...)` fix string generation. |
-| `TelemetryDispatcher` | Builds payloads, validates against JSON Schema, writes JSON lines. |
+Override the directory with `MANIM_VISION_REPORT_DIR`.
 
----
+## Public API
 
-## Telemetry output
+- `ManimVision.monitor(scene, output_mode="llm")`
+- `ManimVision.shutdown(scene)`
+- `ManimVision.results(scene)`
 
-By default, Manim Vision appends to files under your Manim **media** tree (see `config.media_dir`, often `./media`):
+Exceptions re-exported from `manim_vision`:
 
-- `media/manim_vision/<SceneName>_check_digest.jsonl` — **one JSON object per `play` collision check** (intended for LLM feedback and self-iterating scripts). It includes `suppressed` hit counts, `actionable_merged` (one entry per *semantic* pair, keeping the **maximum** overlap area in that play), and suggested `fix_suggestion` / `resolution_mtv` for that representative. This is the main volume-efficient channel.
-- `media/manim_vision/<SceneName>_spatial.jsonl` — *legacy* **per-collision** JSONL (Schema-validated) **only when** you set `MANIM_VISION_PER_PAIR_JSONL=1`. Otherwise it stays unused so huge scenes do not emit tens of thousands of near-duplicate lines.
-- `media/manim_vision/<SceneName>_spatial_log.txt` — a one-line **digest** summary for each play check; the older multi-line **per-collision** blocks are written only in per-pair mode (same env var).
+- `ManimVisionError`
+- `ManimVisionGeometryError`
+- `ManimVisionSchemaError`
+- `ManimVisionProxyError`
 
-Override the directory with `MANIM_VISION_REPORT_DIR`, or set `MANIM_VISION_REPORT_STDOUT=1` to also print pretty JSON to the terminal. When running tests or passing a custom `StringIO` to `TelemetryDispatcher`, the pretty JSON still goes to that stream only (no files).
+## How it works
 
-The payload fields are such as:
+1. `ManimVision.monitor(scene)` attaches an engine, solver, dispatcher, lock, and worker executor to the live scene instance.
+2. A mixin is inserted at runtime so `add`, `play`, and `remove` can register, resync, and deregister geometry.
+3. Collision checks run on a single-worker background executor under a scene lock.
+4. Raw collisions are filtered, semantically grouped, deduplicated across continuous overlap events, and summarized on shutdown.
 
-- `timestamp` — ISO-8601 UTC
-- `scene_name` — Sanitized scene class name
-- `error_type` — e.g. `OVERLAP` (see schema for allowed values)
-- `colliding_entities` — String labels `ClassName_id` for the two mobjects
-- `overlap_area` — Positive float in world units²
-- `resolution_mtv` — `x`, `y`, `z` components (2D analysis uses `z: 0`)
-- `fix_suggestion` — Suggested Manim code, often chained `shift(UP * …).shift(RIGHT * …)` style
+## Notes
 
-The contract is defined in code as `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision/telemetry/schema.py`. Invalid payloads raise `ManimVisionSchemaError`. Report file handles are closed when you call `ManimVision.shutdown(self)` (or the scene’s `shutdown()`).
-
-**Geometry “skips” (Text with no points yet, empty `Mobject`, etc.)** are expected in many Manim scripts. They are logged at **DEBUG** by default so the console is not spammed. Set `MANIM_VISION_VERBOSE_GEO=1` if you need every skip at **WARNING** when debugging the adapter.
-
-**Readable volume (LLM- and log-friendly):**
-
-- **Check digest (default)** — one row per `play` in `*_check_digest.jsonl`; collisions are **grouped** by the same *semantic* pair of labels, so repeated frames of the same mistake do not multiply rows. Set `MANIM_VISION_PER_PAIR_JSONL=1` only if you need the full schema-per-pair `*_spatial.jsonl` for tooling that expects it.
-- **Intentional layout (not reported as actionable):** a `Text` / `MathTex` mobject that is a **submobject of** a `VGroup` / `Square` (number-in-cell, labels inside a frame) and **sibling** `Square`+`Text` in a small `VGroup` (tile cells) are treated as designed overlap, not bugs.
-- **Session deduplication** (for **per-pair** mode only, default for file output): the same *semantic* pair of entities is written **once per render** to `*_spatial.jsonl`; disable with `MANIM_VISION_DISABLE_SESSION_DEDUPE=1`.
-- **Minimum overlap area** — `MANIM_VISION_MIN_OVERLAP_AREA` (default `0.0001` world units²) drops dust-sized intersections from SVG/anti-aliasing.
-- **Same-Text kerning** — adjacent glyph path overlaps *inside* one `Text` / `MathTex` string are ignored (not layout errors).
-- **Entity names** in reports are **broad** where possible, e.g. `Text("Binary Search")#…` or `VGroup#…`, not per-glyph `VMobjectFromSVGPath_…` ids.
-- The terminal logs a short **INFO** line for each `play` spatial check: digest-only vs per-pair, counts of suppressed and actionable groups.
-
----
-
-## Public API and exceptions
-
-**Entry points**
-
-- `manim_vision.ManimVision` — `monitor(scene)`, `shutdown(scene)`.
-
-**Exceptions** (re-exported from `manim_vision`)
-
-| Exception | Meaning |
-|-----------|---------|
-| `ManimVisionError` | Base error (e.g. `monitor()` given a non-`Scene`). |
-| `ManimVisionGeometryError` | `VMobject` could not be turned into valid geometry. |
-| `ManimVisionSchemaError` | Telemetry payload failed JSON Schema validation. |
-| `ManimVisionProxyError` | Reserved for proxy/instrumentation failures. |
-
-**Lower-level types** (used in tests and extensions) live under `manim_vision.geometry`, `manim_vision.proxy`, `manim_vision.solver`, and `manim_vision.telemetry` — e.g. `ManimVisionSceneProxy`, `PrecisionGeometryEngine`, `CollisionResult`, `ConstraintSolver`, `TelemetryDispatcher`.
-
----
-
-## Design notes and limitations
-
-- **2D-style analysis** in the engine: separation vectors use **xy**; mobjects are approximated for outline overlap in the scene plane. Not a full 3D physics engine.
-- **VMobject-oriented**: tracking is built around vectorized mobjects; exotic object types may not register or may log conversion warnings.
-- **Touches vs overlap**: pairs that only **touch** (zero area) are filtered out; positive **overlap area** is what triggers a report.
-- **Heavier geometry** (e.g. concave shapes) may use **centroid / convex-hull fallbacks** in the solver; see `ConstraintSolver` docstrings and implementation for details.
-- The library aims to be **non-invasive**: it does not replace your `self` reference; it only replaces the runtime class of the scene object to install hooks.
-- **Manim’s `copy.deepcopy` and helpers** (used when building many animations) walk each mobject’s `__dict__`. Internals that hold a `threading.Lock` (e.g. the geometry engine) must **not** be stored on the underlying VMobject. Manim Vision keeps that state on the **wrapt proxy** and implements `__deepcopy__` on `ManimVisionMobjectProxy` / `ManimVisionSceneProxy` so creation-style animations (`FadeIn`, `Transform`, etc.) do not fail with `TypeError: cannot pickle '_thread.lock' object`.
-
----
+- Analysis is 2D and based on overlap area, not full 3D physics.
+- Touching edges without positive overlap are ignored.
+- Some concave cases use centroid-based fallbacks for fix hints.
+- Internal lock-bearing state stays on proxies, so Manim creation-style animations still deep-copy safely.
 
 ## Development
 
-From a checkout of the package root (the directory that contains `pyproject.toml`):
-
 ```bash
 python -m venv .venv
-.venv\Scripts\activate          # Windows
-# source .venv/bin/activate     # macOS / Linux
-
+.venv\Scripts\activate
 pip install -e ".[dev]"
 python -m pytest
 ```
 
-Run **Ruff** or your usual formatter if you keep them in the project; tests use **pytest** with `asyncio` mode as configured in `pyproject.toml`.
-
----
-
 ## License
 
-MIT — see the `LICENSE` file in this repository.
+MIT. See `LICENSE`.

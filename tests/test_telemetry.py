@@ -145,3 +145,37 @@ def test_write_check_digest_jsonl_and_summary_line_in_txt(tmp_path) -> None:
     t = txt.read_text(encoding="utf-8")
     assert "manim-vision digest" in t
     assert "actionable=1" in t
+
+
+def test_llm_summary_mode_flushes_compact_scene_summary() -> None:
+    """LLM mode should collapse many event rows into one compact final JSON summary."""
+    buf = io.StringIO()
+    dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="BinarySearchExplained", output_mode="llm")
+    dispatcher.write_check_digest(
+        {
+            "kind": "manim_vision_check_v1",
+            "scene_name": "BinarySearchExplained",
+            "actionable_merged": [
+                {
+                    "pair": ['Text("BinarySearch")', 'Text("Findingitemsfastinsorteddata")'],
+                    "max_overlap_area": 0.1,
+                    "fix_suggestion": "shift(DOWN * 0.1122)",
+                },
+                {
+                    "pair": ['Square[1]', 'Text("1,000items→about10checks")'],
+                    "max_overlap_area": 0.1,
+                    "fix_suggestion": "shift(UP * 0.0950)",
+                },
+                {
+                    "pair": ['Text("Find14")', 'Text("ThedatamustbeSORTEDfirst.")'],
+                    "max_overlap_area": 0.1,
+                    "fix_suggestion": "shift(UP * 0.0602)",
+                },
+            ],
+        }
+    )
+    dispatcher.close()
+    payload = json.loads(buf.getvalue())
+    assert payload["scene"] == "BinarySearchExplained"
+    assert len(payload["issues"]) <= 3
+    assert len(buf.getvalue()) / 4 < 200
