@@ -19,6 +19,7 @@ _TEXT_LIKE_NAMES: frozenset[str] = frozenset(
 _SHAPE_TILE = frozenset({"Square", "Rectangle", "RoundedRectangle", "Circle", "Ellipse"})
 _LABEL_IN_CELL = _TEXT_LIKE_NAMES
 _GENERIC_LEAF_NAMES = frozenset({"VMobjectFromSVGPath", "VectorizedPoint"})
+_PATH_NEAR_PREFIX = "Path near "
 
 
 def min_reportable_overlap_area() -> float:
@@ -44,6 +45,10 @@ class SceneSemanticResolver:
         self._component_members_cache: dict[int, list[Any]] = {}
         self._owners = self._collect_owners()
         self._owner_label_counts = Counter(self._owner_base_label(owner) for owner in self._owners)
+        self._scene_owner_labels: dict[int, str] = getattr(scene, "_manim_vision_owner_labels", {})
+        self._scene_owner_ordinals: dict[str, int] = getattr(scene, "_manim_vision_owner_ordinals", {})
+        setattr(scene, "_manim_vision_owner_labels", self._scene_owner_labels)
+        setattr(scene, "_manim_vision_owner_ordinals", self._scene_owner_ordinals)
 
     def _collect_scene_family(self) -> list[Any]:
         seen: set[int] = set()
@@ -151,19 +156,21 @@ class SceneSemanticResolver:
 
     def _owner_label(self, owner: Any) -> str:
         key = id(owner)
-        cached = self._owner_label_cache.get(key)
+        cached = self._owner_label_cache.get(key) or self._scene_owner_labels.get(key)
         if cached is not None:
+            self._owner_label_cache[key] = cached
             return cached
 
         base = self._owner_base_label(owner)
-        if self._owner_label_counts[base] <= 1:
+        ordinal = self._scene_owner_ordinals.get(base, 0) + 1
+        self._scene_owner_ordinals[base] = ordinal
+        if self._owner_label_counts[base] <= 1 and ordinal == 1:
             label = base
         else:
-            peers = [peer for peer in self._owners if self._owner_base_label(peer) == base]
-            ordinal = next(i for i, peer in enumerate(peers, start=1) if peer is owner)
             label = f"{base}[{ordinal}]"
 
         self._owner_label_cache[key] = label
+        self._scene_owner_labels[key] = label
         return label
 
     def _component_members(self, owner: Any) -> list[Any]:
@@ -221,13 +228,25 @@ class SceneSemanticResolver:
         self._component_label_cache[key] = label
         return label
 
+    def owner_label(self, mob: Any) -> str:
+        """Return the readable scene label for ``mob``'s conceptual owner."""
+        return self._owner_label(self.owner(mob))
+
     def pair_labels(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
         """Return a deterministic ordered label pair for human and machine output."""
         return tuple(sorted((self.label(mob_a), self.label(mob_b))))
 
+    def owner_pair_labels(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
+        """Return a deterministic ordered owner-label pair for semantic event tracking."""
+        return tuple(sorted((self.owner_label(mob_a), self.owner_label(mob_b))))
+
     def event_key(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
         """Stable event key based on component labels."""
         return self.pair_labels(mob_a, mob_b)
+
+    def owner_event_key(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
+        """Stable event key based on semantic owner labels."""
+        return self.owner_pair_labels(mob_a, mob_b)
 
     def is_pair_internal_glyphs_same_text(self, mob_a: Any, mob_b: Any) -> bool:
         """True if both sides are different paths under the same text-like object."""
@@ -240,6 +259,8 @@ class SceneSemanticResolver:
         owner_a = self.owner(mob_a)
         owner_b = self.owner(mob_b)
         if _is_empty_text_like(owner_a) or _is_empty_text_like(owner_b):
+            return True
+        if _is_path_artifact_pair(self._owner_base_label(owner_a), self._owner_base_label(owner_b)):
             return True
         if is_strict_submobject(owner_a, owner_b) or is_strict_submobject(owner_b, owner_a):
             return True
@@ -441,3 +462,19 @@ def _is_component_leaf(mob: Any) -> bool:
         return points is not None and len(points) >= 2
     except TypeError:
         return False
+
+
+def _path_context_label(label: str) -> str | None:
+    if not label.startswith(_PATH_NEAR_PREFIX):
+        return None
+    return label[len(_PATH_NEAR_PREFIX) :]
+
+
+def _is_path_artifact_pair(label_a: str, label_b: str) -> bool:
+    context_a = _path_context_label(label_a)
+    context_b = _path_context_label(label_b)
+    if context_a is not None and context_a == label_b:
+        return True
+    if context_b is not None and context_b == label_a:
+        return True
+    return context_a is not None and context_a == context_b

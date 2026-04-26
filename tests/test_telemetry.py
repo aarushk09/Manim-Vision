@@ -281,7 +281,7 @@ def test_llm_file_mode_writes_parseable_compact_final_context_report(tmp_path) -
         for start, partner in ((0.0, "B"), (1.0, "C"), (2.0, "D")):
             dispatcher.record_collision_event(
                 {
-                    "objects": [f'Text("Anchor").char[{int(start)}]', f'Text("{partner}").char[0]'],
+                    "objects": ['Text("Anchor")', f'Text("{partner}")'],
                     "start_time": start,
                     "end_time": start + 0.5,
                     "duration": 0.5,
@@ -289,6 +289,10 @@ def test_llm_file_mode_writes_parseable_compact_final_context_report(tmp_path) -
                     "peak_centroid": {"x": start, "y": start + 0.25},
                     "resolution_mtv": {"x": 0.0, "y": 0.0, "z": 0.0},
                     "fix_suggestion": "# noop",
+                    "components": [
+                        [f'Text("Anchor").char[{int(start)}]'],
+                        [f'Text("{partner}").char[0]'],
+                    ],
                 }
             )
     finally:
@@ -300,9 +304,43 @@ def test_llm_file_mode_writes_parseable_compact_final_context_report(tmp_path) -
     compact = json.loads(compact_path.read_text(encoding="utf-8"))
 
     assert compact["scene"] == "CompactScene"
-    assert compact["fmt"].startswith("v1")
-    assert compact["B"]
-    assert compact["O"]
-    assert compact["E"]
-    assert compact["G"]
+    assert compact["fmt"].startswith("v2")
+    assert compact["objs"]
+    assert compact["ev"]
+    assert compact["grp"]
     assert len(json.dumps(compact)) < len(json.dumps(grouped))
+
+
+def test_public_summary_compresses_component_labels_into_owner_relative_contact_ranges() -> None:
+    """Component-level contacts should surface as concise owner-relative ranges in the public summary."""
+    buf = io.StringIO()
+    dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="ContactScene", output_mode="llm")
+    dispatcher.record_collision_event(
+        {
+            "objects": ['Text("Title")', 'Text("Subtitle")'],
+            "start_time": 0.0,
+            "end_time": 1.0,
+            "duration": 1.0,
+            "peak_overlap_area": 0.25,
+            "peak_centroid": {"x": 1.0, "y": 2.0},
+            "resolution_mtv": {"x": 0.0, "y": 0.2, "z": 0.0},
+            "fix_suggestion": "shift(UP * 0.2)",
+            "components": [
+                ['Text("Title").char[0]', 'Text("Title").char[1]', 'Text("Title").char[2]'],
+                ['Text("Subtitle").char[4]', 'Text("Subtitle").char[5]'],
+            ],
+            "hotspots": [
+                {
+                    "centroid": {"x": 1.0, "y": 2.0},
+                    "area": 0.25,
+                    "contact": ["char[1]", "char[4]"],
+                }
+            ],
+        }
+    )
+    dispatcher.close()
+    payload = json.loads(buf.getvalue())
+    event = payload["collision_events"][0]
+    assert event["objects"] == ['Text("Title")', 'Text("Subtitle")']
+    assert event["contact_summary"] == ["char[0-2]", "char[4-5]"]
+    assert event["hotspots"][0]["contact"] == ["char[1]", "char[4]"]

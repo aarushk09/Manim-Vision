@@ -162,8 +162,17 @@ class ManimVision:
 
 
 def _default_report_path_for_script(script_path: Path, scene_name: str) -> Path:
-    """Prefer the script-local Manim media directory before the process cwd default."""
-    script_local = script_path.parent / "media" / "manim_vision" / f"{scene_name}_check_digest.jsonl"
-    if script_local.exists():
-        return script_local
+    """Prefer overlay replay payloads, then semantic scene summaries."""
+    script_media = script_path.parent / "media" / "manim_vision"
+    overlay_local = script_media / f"{scene_name}_overlaydata.json"
+    if overlay_local.exists():
+        return overlay_local
+    digest_local = script_media / f"{scene_name}_check_digest.jsonl"
+    if digest_local.exists():
+        return digest_local
+
+    default_dir = default_check_digest_path(scene_name).parent
+    overlay_default = default_dir / f"{scene_name}_overlaydata.json"
+    if overlay_default.exists():
+        return overlay_default
     return default_check_digest_path(scene_name)

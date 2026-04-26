@@ -91,3 +91,35 @@ def test_text_components_get_character_labels() -> None:
     resolver = SceneSemanticResolver(scene)
     assert resolver.label(text[0]) == 'Text("AB").char[0]'
     assert resolver.label(text[1]) == 'Text("AB").char[1]'
+
+
+def test_path_artifact_near_same_text_is_treated_as_intentional() -> None:
+    """Generic path fragments near the same text they came from should not become real collisions."""
+
+    class Artifact:
+        submobjects = ()
+
+        def get_family(self):
+            return (self,)
+
+        def get_center(self):
+            return (0.0, 0.0, 0.0)
+
+    class TextLike:
+        def __init__(self, text: str) -> None:
+            self.original_text = text
+            self.submobjects = ()
+
+        def get_family(self):
+            return (self,)
+
+        def get_center(self):
+            return (0.0, 0.0, 0.0)
+
+    artifact = Artifact()
+    artifact.__class__.__name__ = "VMobjectFromSVGPath"
+    text = TextLike("Caption")
+    text.__class__.__name__ = "Text"
+    scene = SimpleNamespace(mobjects=[text, artifact])
+    resolver = SceneSemanticResolver(scene)
+    assert resolver.is_intentional_layout_pair(artifact, text) is True

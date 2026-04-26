@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import copy
 import logging
+import re
 import threading
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import wrapt
+from shapely.ops import unary_union
 
 from manim_vision.geometry.engine import CollisionResult, PrecisionGeometryEngine
 from manim_vision.geometry.registration import (
@@ -26,6 +28,7 @@ from manim_vision.overlay import serialize_overlap_geometry
 from manim_vision.telemetry.dispatcher import TelemetryDispatcher
 
 logger = logging.getLogger(__name__)
+_COMPONENT_SUFFIX_RE = re.compile(r"^(?P<owner>.+?)\.(?P<role>char|glyph|part)\[(?P<index>\d+)\]$")
 
 
 @dataclass
@@ -41,6 +44,119 @@ class ActiveCollisionEvent:
     resolution_mtv: tuple[float, float, float]
     fix_suggestion: str
     samples: list[dict[str, Any]]
+    left_components: set[str] = field(default_factory=set)
+    right_components: set[str] = field(default_factory=set)
+    hotspots: list[dict[str, Any]] = field(default_factory=list)
+
+
+def _component_contact(label: str, owner: str) -> str:
+    """Return the owner-relative component suffix for compact contact summaries."""
+    if label == owner:
+        return "whole"
+    match = _COMPONENT_SUFFIX_RE.match(label)
+    if match and match.group("owner") == owner:
+        return f"{match.group('role')}[{match.group('index')}]"
+    if label.startswith(owner + "."):
+        return label[len(owner) + 1 :]
+    return label
+
+
+def _current_pair_snapshot(
+    members: list[tuple[Any, Any, CollisionResult]],
+    resolver: SceneSemanticResolver,
+) -> tuple[
+    tuple[str, str],
+    tuple[set[str], set[str]],
+    float,
+    tuple[float, float],
+    dict[str, Any],
+    list[dict[str, Any]],
+]:
+    """Summarize all leaf collisions currently active for one semantic owner pair."""
+    first_a, first_b, first_collision = members[0]
+    owner_labels = resolver.owner_pair_labels(first_a, first_b)
+    left_components: set[str] = set()
+    right_components: set[str] = set()
+    geometries = []
+    hotspots: dict[tuple[Any, ...], dict[str, Any]] = {}
+
+    for mob_a, mob_b, collision in members:
+        owner_a = resolver.owner_label(mob_a)
+        owner_b = resolver.owner_label(mob_b)
+        component_a = resolver.label(mob_a)
+        component_b = resolver.label(mob_b)
+        if (owner_a, owner_b) == owner_labels:
+            left_label, right_label = component_a, component_b
+        else:
+            left_label, right_label = component_b, component_a
+
+        left_components.add(left_label)
+        right_components.add(right_label)
+        geometries.append(collision.overlap_geometry)
+        centroid = collision.overlap_centroid
+        hotspot = {
+            "area": float(collision.overlap_area),
+            "centroid": {"x": float(centroid[0]), "y": float(centroid[1])},
+            "contact": [
+                _component_contact(left_label, owner_labels[0]),
+                _component_contact(right_label, owner_labels[1]),
+            ],
+        }
+        hotspot_key = (
+            round(float(centroid[0]), 3),
+            round(float(centroid[1]), 3),
+            hotspot["contact"][0],
+            hotspot["contact"][1],
+        )
+        previous = hotspots.get(hotspot_key)
+        if previous is None or float(previous["area"]) < float(hotspot["area"]):
+            hotspots[hotspot_key] = hotspot
+
+    union_geometry = unary_union(geometries)
+    area = float(getattr(union_geometry, "area", 0.0))
+    if area > 0.0:
+        centroid_geom = union_geometry.centroid
+        centroid = (float(centroid_geom.x), float(centroid_geom.y))
+        geometry_payload = serialize_overlap_geometry(union_geometry)
+    else:
+        centroid = first_collision.overlap_centroid
+        geometry_payload = serialize_overlap_geometry(first_collision.overlap_geometry)
+
+    hotspot_list = sorted(
+        hotspots.values(),
+        key=lambda item: (-float(item["area"]), float(item["centroid"]["x"]), float(item["centroid"]["y"])),
+    )[:3]
+    return owner_labels, (left_components, right_components), area, centroid, geometry_payload, hotspot_list
+
+
+def _merge_hotspots(
+    existing: list[dict[str, Any]],
+    incoming: list[dict[str, Any]],
+    *,
+    limit: int = 3,
+) -> list[dict[str, Any]]:
+    """Keep the strongest unique hotspots across the full overlap interval."""
+    merged: dict[tuple[Any, ...], dict[str, Any]] = {}
+    for hotspot in [*existing, *incoming]:
+        centroid = hotspot.get("centroid") or {}
+        contact = list(hotspot.get("contact") or ["", ""])
+        key = (
+            round(float(centroid.get("x", 0.0)), 3),
+            round(float(centroid.get("y", 0.0)), 3),
+            contact[0],
+            contact[1],
+        )
+        previous = merged.get(key)
+        if previous is None or float(previous.get("area", 0.0)) < float(hotspot.get("area", 0.0)):
+            merged[key] = hotspot
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            -float(item.get("area", 0.0)),
+            float((item.get("centroid") or {}).get("x", 0.0)),
+            float((item.get("centroid") or {}).get("y", 0.0)),
+        ),
+    )[:limit]
 
 
 def _scene_time_seconds(scene: Any) -> float:
@@ -78,13 +194,18 @@ def _event_payload(event: ActiveCollisionEvent, *, end_time: float) -> dict[str,
         },
         "fix_suggestion": event.fix_suggestion,
         "samples": list(event.samples),
+        "components": [
+            sorted(event.left_components),
+            sorted(event.right_components),
+        ],
+        "hotspots": list(event.hotspots),
     }
 
 
 def _close_finished_events(
-    active_events: dict[tuple[int, int], ActiveCollisionEvent],
+    active_events: dict[tuple[str, str], ActiveCollisionEvent],
     dispatcher: TelemetryDispatcher,
-    open_now: set[tuple[int, int]],
+    open_now: set[tuple[str, str]],
     timestamp: float,
 ) -> None:
     """Finalize every active pair that is no longer overlapping."""
@@ -95,7 +216,7 @@ def _close_finished_events(
 def _flush_open_collision_events(scene: Any) -> None:
     """Finalize intervals still open when monitoring shuts down."""
     dispatcher = getattr(scene, "_self_dispatcher", None)
-    active_events: dict[tuple[int, int], ActiveCollisionEvent] = getattr(
+    active_events: dict[tuple[str, str], ActiveCollisionEvent] = getattr(
         scene,
         "_self_active_collision_events",
         {},
@@ -115,7 +236,7 @@ def _execute_collision_check(scene: Any) -> None:
     solver = getattr(scene, "_self_solver")
     dispatcher = getattr(scene, "_self_dispatcher")
     scene_name = getattr(scene, "_manim_vision_scene_class_name")
-    active_events: dict[tuple[int, int], ActiveCollisionEvent] = getattr(
+    active_events: dict[tuple[str, str], ActiveCollisionEvent] = getattr(
         scene,
         "_self_active_collision_events",
     )
@@ -165,12 +286,12 @@ def _execute_collision_check(scene: Any) -> None:
 
         solver.apply_force_relaxation(work)
 
-        clusters: dict[tuple[int, int], list[CollisionResult]] = {}
+        clusters: dict[tuple[str, str], list[tuple[Any, Any, CollisionResult]]] = {}
         for collision in work:
             mobject_a = engine._registry[collision.mobject_a_id][0]
             mobject_b = engine._registry[collision.mobject_b_id][0]
-            event_key = resolver.event_key(mobject_a, mobject_b)
-            clusters.setdefault(event_key, []).append(collision)
+            event_key = resolver.owner_event_key(mobject_a, mobject_b)
+            clusters.setdefault(event_key, []).append((mobject_a, mobject_b, collision))
 
         current_events = set(clusters)
         _close_finished_events(active_events, dispatcher, current_events, timestamp)
@@ -182,12 +303,13 @@ def _execute_collision_check(scene: Any) -> None:
 
         for event_key in sorted(current_events):
             group = clusters[event_key]
-            best = max(group, key=lambda collision: collision.overlap_area)
-            mobject_a = engine._registry[best.mobject_a_id][0]
-            mobject_b = engine._registry[best.mobject_b_id][0]
+            best_mobject_a, best_mobject_b, best = max(group, key=lambda item: item[2].overlap_area)
             mtv = solver.calculate_mtv(best)
             fix_syntax = solver.generate_fix_syntax(mtv)
-            label_a, label_b = resolver.pair_labels(mobject_a, mobject_b)
+            owner_labels, component_sets, total_area, centroid, geometry_payload, hotspots = _current_pair_snapshot(
+                group,
+                resolver,
+            )
             mtv_tuple = (
                 float(mtv[0]),
                 float(mtv[1]),
@@ -195,49 +317,53 @@ def _execute_collision_check(scene: Any) -> None:
             )
 
             if event_key not in active_events:
-                geometry_payload = serialize_overlap_geometry(best.overlap_geometry)
                 active_events[event_key] = ActiveCollisionEvent(
-                    objects=(label_a, label_b),
+                    objects=owner_labels,
                     start_time=timestamp,
                     latest_time=timestamp,
-                    peak_overlap_area=float(best.overlap_area),
-                    peak_centroid=best.overlap_centroid,
+                    peak_overlap_area=float(total_area),
+                    peak_centroid=centroid,
                     peak_geometry=geometry_payload,
                     resolution_mtv=mtv_tuple,
                     fix_suggestion=fix_syntax,
                     samples=[
                         {
                             "time": float(timestamp),
-                            "area": float(best.overlap_area),
+                            "area": float(total_area),
                             "centroid": {
-                                "x": float(best.overlap_centroid[0]),
-                                "y": float(best.overlap_centroid[1]),
+                                "x": float(centroid[0]),
+                                "y": float(centroid[1]),
                             },
                             "geometry": geometry_payload,
                         }
                     ],
+                    left_components=set(component_sets[0]),
+                    right_components=set(component_sets[1]),
+                    hotspots=_merge_hotspots([], hotspots),
                 )
                 n_opened += 1
             else:
                 event = active_events[event_key]
                 event.latest_time = timestamp
-                event.objects = (label_a, label_b)
-                geometry_payload = serialize_overlap_geometry(best.overlap_geometry)
+                event.objects = owner_labels
+                event.left_components.update(component_sets[0])
+                event.right_components.update(component_sets[1])
                 if not event.samples or float(event.samples[-1].get("time", -1.0)) != float(timestamp):
                     event.samples.append(
                         {
                             "time": float(timestamp),
-                            "area": float(best.overlap_area),
+                            "area": float(total_area),
                             "centroid": {
-                                "x": float(best.overlap_centroid[0]),
-                                "y": float(best.overlap_centroid[1]),
+                                "x": float(centroid[0]),
+                                "y": float(centroid[1]),
                             },
                             "geometry": geometry_payload,
                         }
                     )
-                if float(best.overlap_area) >= float(event.peak_overlap_area):
-                    event.peak_overlap_area = float(best.overlap_area)
-                    event.peak_centroid = best.overlap_centroid
+                event.hotspots = _merge_hotspots(event.hotspots, hotspots)
+                if float(total_area) >= float(event.peak_overlap_area):
+                    event.peak_overlap_area = float(total_area)
+                    event.peak_centroid = centroid
                     event.peak_geometry = geometry_payload
                     event.resolution_mtv = mtv_tuple
                     event.fix_suggestion = fix_syntax
@@ -248,7 +374,7 @@ def _execute_collision_check(scene: Any) -> None:
                     mtv,
                     fix_syntax,
                     scene_name=scene_name,
-                    entity_labels=(label_a, label_b),
+                    entity_labels=resolver.pair_labels(best_mobject_a, best_mobject_b),
                 )
                 if dispatched is None:
                     n_duped += 1
