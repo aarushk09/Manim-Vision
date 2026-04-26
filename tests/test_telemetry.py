@@ -109,3 +109,39 @@ def test_file_output_jsonl_and_human_txt(tmp_path) -> None:
     text_body = txt.read_text(encoding="utf-8")
     assert "OVERLAP" in text_body
     assert "entities:" in text_body
+
+
+def test_write_check_digest_jsonl_and_summary_line_in_txt(tmp_path) -> None:
+    """``write_check_digest`` appends a JSON line and a one-line human summary in the log."""
+    from manim_vision.telemetry.paths import check_digest_path_next_to_spatial_jsonl
+
+    jsonl = tmp_path / "S_spatial.jsonl"
+    txt = tmp_path / "S_log.txt"
+    dpath = check_digest_path_next_to_spatial_jsonl(jsonl)
+    assert dpath == tmp_path / "S_check_digest.jsonl"
+    dispatcher = TelemetryDispatcher(
+        jsonl_path=jsonl,
+        text_path=txt,
+        check_digest_path=dpath,
+        scene_name="S",
+    )
+    try:
+        dispatcher.write_check_digest(
+            {
+                "kind": "manim_vision_check_v1",
+                "scene_name": "S",
+                "raw_pair_hits": 5,
+                "suppressed": {"below_min_area": 1},
+                "actionable_merged": [{"pair": ["A", "B"]}],
+            }
+        )
+    finally:
+        dispatcher.close()
+    jline = dpath.read_text(encoding="utf-8").strip().splitlines()
+    assert len(jline) == 1
+    out = json.loads(jline[0])
+    assert out["kind"] == "manim_vision_check_v1"
+    assert len(out["actionable_merged"]) == 1
+    t = txt.read_text(encoding="utf-8")
+    assert "manim-vision digest" in t
+    assert "actionable=1" in t

@@ -40,3 +40,20 @@ def default_report_paths(scene_name: str) -> tuple[Path, Path]:
     base = _safe_scene_name(scene_name)
     d = default_report_dir()
     return d / f"{base}_spatial.jsonl", d / f"{base}_spatial_log.txt"
+
+
+def default_check_digest_path(scene_name: str) -> Path:
+    """One JSON object per play-check, merged for LLM feedback: ``{base}_check_digest.jsonl``."""
+    base = _safe_scene_name(scene_name)
+    d = default_report_dir()
+    return d / f"{base}_check_digest.jsonl"
+
+
+def check_digest_path_next_to_spatial_jsonl(spatial_jsonl: Path) -> Path:
+    """``BinarySearch_spatial.jsonl`` → ``BinarySearch_check_digest.jsonl``; ``e.jsonl`` → ``e_check_digest.jsonl``."""
+    stem = spatial_jsonl.stem
+    if stem.endswith("_spatial"):
+        base = stem[: -len("_spatial")]
+    else:
+        base = stem
+    return spatial_jsonl.parent / f"{base}_check_digest.jsonl"

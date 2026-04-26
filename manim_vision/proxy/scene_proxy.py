@@ -16,9 +16,12 @@ from manim_vision.geometry.registration import (
     register_mobject_families_in_engine,
 )
 from manim_vision.semantic import (
+    is_intentional_layout_pair,
     is_pair_internal_glyphs_same_text,
     min_reportable_overlap_area,
+    per_pair_jsonl_enabled,
     semantic_label,
+    stable_pair_key,
 )
 from manim_vision.solver.constraint import ConstraintSolver
 from manim_vision.telemetry.dispatcher import TelemetryDispatcher
@@ -50,9 +53,10 @@ def _execute_collision_check(scene: Any) -> None:
             return
 
         min_a = min_reportable_overlap_area()
-        filtered: list[CollisionResult] = []
+        work: list[CollisionResult] = []
         n_tiny = 0
         n_glyphs = 0
+        n_intent = 0
         for cr in raw_hits:
             if cr.overlap_area < min_a:
                 n_tiny += 1
@@ -62,47 +66,118 @@ def _execute_collision_check(scene: Any) -> None:
             if is_pair_internal_glyphs_same_text(m_a, m_b, scene):
                 n_glyphs += 1
                 continue
-            filtered.append(cr)
+            if is_intentional_layout_pair(m_a, m_b, scene):
+                n_intent += 1
+                continue
+            work.append(cr)
 
-        if not filtered:
-            return
+        suppressed = {
+            "below_min_area": n_tiny,
+            "same_text_glyphs": n_glyphs,
+            "intentional_layout": n_intent,
+        }
 
-        solver.apply_force_relaxation(filtered)
-
-        n_new = 0
-        n_duped = 0
-        for cr in filtered:
-            m_a = engine._registry[cr.mobject_a_id][0]
-            m_b = engine._registry[cr.mobject_b_id][0]
-            mtv = solver.calculate_mtv(cr)
-            fix_syntax = solver.generate_fix_syntax(mtv)
-            labels = (semantic_label(m_a, scene), semantic_label(m_b, scene))
-            out = dispatcher.dispatch(
-                cr,
-                mtv,
-                fix_syntax,
-                scene_name=scene_name,
-                entity_labels=labels,
+        if not work:
+            dispatcher.write_check_digest(
+                {
+                    "kind": "manim_vision_check_v1",
+                    "scene_name": scene_name,
+                    "raw_pair_hits": len(raw_hits),
+                    "suppressed": suppressed,
+                    "actionable_merged": [],
+                    "note": "all overlaps in this check were treated as non-actionable (noise, nested layout, or number-in-tile).",
+                }
             )
-            if out is None:
-                n_duped += 1
-            else:
-                n_new += 1
-
-        if n_new:
             logger.info(
-                "Manim Vision: %d new unique overlap report(s) for scene %s (check had %d raw, "
-                "%d below min area, %d same-text internal, %d duplicate vs earlier in session).",
-                n_new,
+                "Manim Vision: spatial check for %s — 0 actionable after filters "
+                "(raw=%d, suppressed %r).",
                 scene_name,
                 len(raw_hits),
-                n_tiny,
-                n_glyphs,
-                n_duped,
+                suppressed,
             )
-        elif filtered:
+            return
+
+        solver.apply_force_relaxation(work)
+
+        clusters: dict[str, list[CollisionResult]] = {}
+        for cr in work:
+            m_a = engine._registry[cr.mobject_a_id][0]
+            m_b = engine._registry[cr.mobject_b_id][0]
+            k = stable_pair_key(semantic_label(m_a, scene), semantic_label(m_b, scene))
+            clusters.setdefault(k, []).append(cr)
+
+        per_pair = per_pair_jsonl_enabled()
+        n_new = 0
+        n_duped = 0
+        actionable: list[dict[str, Any]] = []
+
+        for _key, group in clusters.items():
+            best = max(group, key=lambda c: c.overlap_area)
+            m_a = engine._registry[best.mobject_a_id][0]
+            m_b = engine._registry[best.mobject_b_id][0]
+            mtv = solver.calculate_mtv(best)
+            fix_syntax = solver.generate_fix_syntax(mtv)
+            la, lb = semantic_label(m_a, scene), semantic_label(m_b, scene)
+            if per_pair:
+                out = dispatcher.dispatch(
+                    best,
+                    mtv,
+                    fix_syntax,
+                    scene_name=scene_name,
+                    entity_labels=(la, lb),
+                )
+                if out is None:
+                    n_duped += 1
+                else:
+                    n_new += 1
+            actionable.append(
+                {
+                    "pair": [la, lb],
+                    "merged_from": len(group),
+                    "max_overlap_area": float(best.overlap_area),
+                    "resolution_mtv": {
+                        "x": float(mtv[0]),
+                        "y": float(mtv[1]),
+                        "z": float(mtv[2]) if len(mtv) > 2 else 0.0,
+                    },
+                    "fix_suggestion": fix_syntax,
+                }
+            )
+
+        dispatcher.write_check_digest(
+            {
+                "kind": "manim_vision_check_v1",
+                "scene_name": scene_name,
+                "raw_pair_hits": len(raw_hits),
+                "suppressed": suppressed,
+                "actionable_merged": actionable,
+            }
+        )
+
+        n_action = len(actionable)
+        if per_pair and n_new:
+            logger.info(
+                "Manim Vision: %d new per-pair JSONL line(s) for %s (digest merged %d pair label(s) from %d raw; "
+                "raw=%d, suppressed %r).",
+                n_new,
+                scene_name,
+                n_action,
+                len(work),
+                len(raw_hits),
+                suppressed,
+            )
+        elif n_action and not per_pair:
+            logger.info(
+                "Manim Vision: digest only — %d actionable group(s) for %s "
+                "(set MANIM_VISION_PER_PAIR_JSONL=1 for legacy one-line-per-pair; raw=%d, suppressed %r).",
+                n_action,
+                scene_name,
+                len(raw_hits),
+                suppressed,
+            )
+        elif per_pair and n_action:
             logger.debug(
-                "Manim Vision: 0 new reports (all %d pair(s) already in session) for %s",
+                "Manim Vision: 0 new per-pair lines (all %d merged pair(s) duplicate vs session) for %s",
                 n_duped,
                 scene_name,
             )

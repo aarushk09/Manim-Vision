@@ -13,9 +13,9 @@ from typing import Any, TextIO
 from jsonschema import ValidationError, validate
 
 from manim_vision.exceptions import ManimVisionSchemaError
-from manim_vision.telemetry.paths import default_report_paths
+from manim_vision.telemetry.paths import check_digest_path_next_to_spatial_jsonl, default_report_paths
 from manim_vision.telemetry.schema import MANIM_VISION_SPATIAL_REPORT_SCHEMA
-from manim_vision.semantic import stable_pair_key, session_dedupe_enabled
+from manim_vision.semantic import session_dedupe_enabled, stable_pair_key
 
 logger = logging.getLogger("manim_vision.telemetry")
 
@@ -43,6 +43,7 @@ class TelemetryDispatcher:
         *,
         jsonl_path: Path | str | None = None,
         text_path: Path | str | None = None,
+        check_digest_path: Path | str | None = None,
         also_stdout: bool | None = None,
     ) -> None:
         """Create a dispatcher.
@@ -63,6 +64,8 @@ class TelemetryDispatcher:
         self._default_scene_name = scene_name
         self._logger = logging.getLogger("manim_vision.telemetry")
         self._text_stream: TextIO | None = None
+        self._digest_stream: TextIO | None = None
+        self._digest_path: Path | None = None
         self._owns = False
         self._jsonl_path: Path | None = None
         self._txt_path: Path | None = None
@@ -79,6 +82,9 @@ class TelemetryDispatcher:
             text_path = d_txt
         self._jsonl_path = Path(jsonl_path)
         self._txt_path = Path(text_path)
+        self._digest_path = (
+            Path(check_digest_path) if check_digest_path is not None else check_digest_path_next_to_spatial_jsonl(self._jsonl_path)
+        )
         self._jsonl_path.parent.mkdir(parents=True, exist_ok=True)
         self._txt_path.parent.mkdir(parents=True, exist_ok=True)
         self._json_stream = self._jsonl_path.open("a", encoding="utf-8")
@@ -107,16 +113,54 @@ class TelemetryDispatcher:
         """Human-readable log file path, or ``None`` if a stream was passed."""
         return self._txt_path if self._owns else None
 
+    @property
+    def check_digest_path(self) -> Path | None:
+        """``*_check_digest.jsonl`` (lazy-created on first :meth:`write_check_digest`)."""
+        return self._digest_path if self._owns else None
+
+    def write_check_digest(self, report: dict[str, Any]) -> None:
+        """Append one compact JSON line per play-check (merged pairs; default feedback channel).
+
+        The digest is **not** validated by the per-event JSON Schema; it is a summary object.
+        """
+        if not self._owns or self._digest_path is None:
+            return
+        ts = (
+            datetime.datetime.now(datetime.timezone.utc)
+            .replace(microsecond=0)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+        body = {**report, "timestamp": report.get("timestamp", ts)}
+        line = json.dumps(body, ensure_ascii=False, separators=(",", ":")) + "\n"
+        if self._digest_stream is None:
+            self._digest_path.parent.mkdir(parents=True, exist_ok=True)
+            self._digest_stream = self._digest_path.open("a", encoding="utf-8")
+        self._digest_stream.write(line)
+        self._digest_stream.flush()
+        if self._text_stream is not None:
+            am = body.get("actionable_merged") or []
+            sup = body.get("suppressed") or {}
+            n_sup = 0
+            if isinstance(sup, dict) and all(isinstance(x, (int, float)) for x in sup.values()):
+                n_sup = int(sum(sup.values()))
+            self._text_stream.write(
+                f"\n[manim-vision digest]  ts={ts}  actionable={len(am)}  suppressed_hits~={n_sup}  "
+                f"raw_pair_hits={body.get('raw_pair_hits', '?')}\n"
+            )
+            self._text_stream.flush()
+
     def close(self) -> None:
         """Close opened report files. Safe to call more than once."""
         if not self._owns:
             return
-        for s in (getattr(self, "_json_stream", None), self._text_stream):
+        for s in (getattr(self, "_json_stream", None), self._text_stream, self._digest_stream):
             if s and not s.closed and s is not sys.stdout and s is not sys.stderr:
                 try:
                     s.flush()
                 finally:
                     s.close()
+        self._digest_stream = None
         self._owns = False
 
     def dispatch(

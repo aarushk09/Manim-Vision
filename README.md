@@ -32,7 +32,7 @@
 - **Wraps** each *root* mobject in `add` with a transparent **proxy** that refreshes stored geometry when you call common **spatial** methods on the root only (`shift`, `scale`, `rotate`, `move_to`, `next_to`, `align_to`, `set_x` / `set_y` / `set_z`, `stretch`, `apply_matrix`, `apply_function`); submobject motion is still captured in the per-`play` resync.
 - **Detects** pairwise overlaps using **Shapely** (narrow phase, with DE-9IM / intersection area) on top of a **Shapely STRtree** for broad phase.
 - **Relaxes** overlapping pairs with an internal **force-based iteration** and computes **MTV-style** separation hints (`ConstraintSolver`).
-- **Emits** one **validated JSON** document per collision to **stdout** by default (JSON Schema: `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision.telemetry.schema`).
+- **Emits** a **check digest** (one JSON per `play` by default) to `media/manim_vision/<SceneName>_check_digest.jsonl`, with optional **per-collision** Schema-validated JSONL when you set `MANIM_VISION_PER_PAIR_JSONL=1` (see [Telemetry output](#telemetry-output)).
 
 Collision work runs on a **dedicated single-worker thread pool** so the main animation thread is not blocked by geometry queries.
 
@@ -101,10 +101,11 @@ Internal pieces (for reading the code or building on top of the library):
 
 ## Telemetry output
 
-By default, each collision is **appended to two files** under your Manim **media** tree (see `config.media_dir`, often `./media`):
+By default, Manim Vision appends to files under your Manim **media** tree (see `config.media_dir`, often `./media`):
 
-- `media/manim_vision/<SceneName>_spatial.jsonl` — one **JSON object per line** (easy to process with tools or `jq`)
-- `media/manim_vision/<SceneName>_spatial_log.txt` — the same event as a **human-readable** block (timestamp, entities, overlap area, MTV, fix hint)
+- `media/manim_vision/<SceneName>_check_digest.jsonl` — **one JSON object per `play` collision check** (intended for LLM feedback and self-iterating scripts). It includes `suppressed` hit counts, `actionable_merged` (one entry per *semantic* pair, keeping the **maximum** overlap area in that play), and suggested `fix_suggestion` / `resolution_mtv` for that representative. This is the main volume-efficient channel.
+- `media/manim_vision/<SceneName>_spatial.jsonl` — *legacy* **per-collision** JSONL (Schema-validated) **only when** you set `MANIM_VISION_PER_PAIR_JSONL=1`. Otherwise it stays unused so huge scenes do not emit tens of thousands of near-duplicate lines.
+- `media/manim_vision/<SceneName>_spatial_log.txt` — a one-line **digest** summary for each play check; the older multi-line **per-collision** blocks are written only in per-pair mode (same env var).
 
 Override the directory with `MANIM_VISION_REPORT_DIR`, or set `MANIM_VISION_REPORT_STDOUT=1` to also print pretty JSON to the terminal. When running tests or passing a custom `StringIO` to `TelemetryDispatcher`, the pretty JSON still goes to that stream only (no files).
 
@@ -124,11 +125,13 @@ The contract is defined in code as `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `mani
 
 **Readable volume (LLM- and log-friendly):**
 
-- **Session deduplication** (default, file output only): the same *semantic* pair of entities is written **once per render**; later `play` calls that still overlap do not append more JSONL lines. Disable with `MANIM_VISION_DISABLE_SESSION_DEDUPE=1`.
+- **Check digest (default)** — one row per `play` in `*_check_digest.jsonl`; collisions are **grouped** by the same *semantic* pair of labels, so repeated frames of the same mistake do not multiply rows. Set `MANIM_VISION_PER_PAIR_JSONL=1` only if you need the full schema-per-pair `*_spatial.jsonl` for tooling that expects it.
+- **Intentional layout (not reported as actionable):** a `Text` / `MathTex` mobject that is a **submobject of** a `VGroup` / `Square` (number-in-cell, labels inside a frame) and **sibling** `Square`+`Text` in a small `VGroup` (tile cells) are treated as designed overlap, not bugs.
+- **Session deduplication** (for **per-pair** mode only, default for file output): the same *semantic* pair of entities is written **once per render** to `*_spatial.jsonl`; disable with `MANIM_VISION_DISABLE_SESSION_DEDUPE=1`.
 - **Minimum overlap area** — `MANIM_VISION_MIN_OVERLAP_AREA` (default `0.0001` world units²) drops dust-sized intersections from SVG/anti-aliasing.
 - **Same-Text kerning** — adjacent glyph path overlaps *inside* one `Text` / `MathTex` string are ignored (not layout errors).
 - **Entity names** in reports are **broad** where possible, e.g. `Text("Binary Search")#…` or `VGroup#…`, not per-glyph `VMobjectFromSVGPath_…` ids.
-- The terminal prints **at most one** INFO line per `play` when there are **new** unique report rows, plus short counts; repeated overlaps that are only deduplicates log at **DEBUG** only.
+- The terminal logs a short **INFO** line for each `play` spatial check: digest-only vs per-pair, counts of suppressed and actionable groups.
 
 ---
 

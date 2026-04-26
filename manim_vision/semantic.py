@@ -108,3 +108,53 @@ def session_dedupe_enabled() -> bool:
         "true",
         "yes",
     )
+
+
+def per_pair_jsonl_enabled() -> bool:
+    """Legacy: one JSON line per overlap pair. Default off (digest-only) — set ``MANIM_VISION_PER_PAIR_JSONL=1``."""
+    return os.environ.get("MANIM_VISION_PER_PAIR_JSONL", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
+
+
+def is_strict_submobject(mob_ancestor: Any, mob_sub: Any) -> bool:
+    """True if ``mob_sub`` is a strict descendant in Manim’s tree of ``mob_ancestor`` (kerning / label-in-tile / group outline)."""
+    if mob_ancestor is None or mob_sub is None or mob_ancestor is mob_sub:
+        return False
+    try:
+        if mob_sub in mob_ancestor.get_family():
+            return True
+    except (TypeError, AttributeError, RecursionError):
+        return False
+    return False
+
+
+def is_intentional_layout_pair(mob_a: Any, mob_b: Any, scene: Any) -> bool:
+    """Skip overlaps a human would *not* count as a mistake.
+
+    1) **Nested mobject** — a label inside a :class:`VGroup`, a glyph inside :class:`Text`, etc. The outer drawn outline vs inner content is not a *cross* compositing bug.
+
+    2) **Siblings in a 2-tile** — direct children ``Square``/``Circle``/``Rectangle``/``RoundedRectangle`` + :class:`Text` under the *same* small :class:`VGroup` (number-in-cell tiles).
+    """
+    if is_strict_submobject(mob_a, mob_b) or is_strict_submobject(mob_b, mob_a):
+        return True
+    return _sibling_shape_with_text_tiles(mob_a, mob_b, scene)
+
+
+_SHAPE_TILE = frozenset({"Square", "Rectangle", "RoundedRectangle", "Circle", "Ellipse"})
+_LABEL_IN_CELL = _TEXT_LIKE_NAMES
+
+
+def _sibling_shape_with_text_tiles(mob_a: Any, mob_b: Any, scene: Any) -> bool:
+    a_name, b_name = type(mob_a).__name__, type(mob_b).__name__
+    for root in list(scene.mobjects):
+        for g in root.get_family():
+            if type(g).__name__ != "VGroup" or not g.submobjects:
+                continue
+            if mob_a in g.submobjects and mob_b in g.submobjects:
+                st = {a_name, b_name}
+                if st & _SHAPE_TILE and st & _LABEL_IN_CELL and len(g.submobjects) <= 6:
+                    return True
+    return False
