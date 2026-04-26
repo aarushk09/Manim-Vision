@@ -28,6 +28,7 @@ def _sample_collision() -> CollisionResult:
         geom_a=a,
         geom_b=b,
         overlap_area=float(inter.area),
+        overlap_centroid=tuple(inter.centroid.coords[0]),
         overlap_geometry=inter,
     )
 
@@ -86,10 +87,20 @@ def test_session_dedupe_skips_second_identical_pair(tmp_path) -> None:
     txt = tmp_path / "d.txt"
     dispatcher = TelemetryDispatcher(jsonl_path=jsonl, text_path=txt, scene_name="S")
     try:
-        a = dispatcher.dispatch(_sample_collision(), np.array([0.0, 0.0, 0.0]), "# a", entity_labels=("A", "B"))
-        b = dispatcher.dispatch(_sample_collision(), np.array([0.0, 0.0, 0.0]), "# b", entity_labels=("A", "B"))
-        assert a is not None
-        assert b is None
+        first = dispatcher.dispatch(
+            _sample_collision(),
+            np.array([0.0, 0.0, 0.0]),
+            "# a",
+            entity_labels=("A", "B"),
+        )
+        second = dispatcher.dispatch(
+            _sample_collision(),
+            np.array([0.0, 0.0, 0.0]),
+            "# b",
+            entity_labels=("A", "B"),
+        )
+        assert first is not None
+        assert second is None
         assert len(jsonl.read_text().strip().splitlines()) == 1
     finally:
         dispatcher.close()
@@ -112,7 +123,7 @@ def test_file_output_jsonl_and_human_txt(tmp_path) -> None:
 
 
 def test_write_check_digest_jsonl_and_summary_line_in_txt(tmp_path) -> None:
-    """``write_check_digest`` appends a JSON line and a one-line human summary in the log."""
+    """Legacy ``write_check_digest`` still appends a JSON line and a one-line text summary."""
     from manim_vision.telemetry.paths import check_digest_path_next_to_spatial_jsonl
 
     jsonl = tmp_path / "S_spatial.jsonl"
@@ -137,45 +148,38 @@ def test_write_check_digest_jsonl_and_summary_line_in_txt(tmp_path) -> None:
         )
     finally:
         dispatcher.close()
-    jline = dpath.read_text(encoding="utf-8").strip().splitlines()
-    assert len(jline) == 1
-    out = json.loads(jline[0])
-    assert out["kind"] == "manim_vision_check_v1"
-    assert len(out["actionable_merged"]) == 1
-    t = txt.read_text(encoding="utf-8")
-    assert "manim-vision digest" in t
-    assert "actionable=1" in t
+    lines = dpath.read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    payload = json.loads(lines[0])
+    assert payload["kind"] == "manim_vision_check_v1"
+    assert len(payload["actionable_merged"]) == 1
+    text_body = txt.read_text(encoding="utf-8")
+    assert "manim-vision digest" in text_body
+    assert "actionable=1" in text_body
 
 
-def test_llm_summary_mode_flushes_compact_scene_summary() -> None:
-    """LLM mode should collapse many event rows into one compact final JSON summary."""
+def test_llm_summary_mode_flushes_collision_timeline() -> None:
+    """LLM mode should flush finalized collision intervals with timing and geometry."""
     buf = io.StringIO()
     dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="BinarySearchExplained", output_mode="llm")
-    dispatcher.write_check_digest(
+    dispatcher.record_collision_event(
         {
-            "kind": "manim_vision_check_v1",
-            "scene_name": "BinarySearchExplained",
-            "actionable_merged": [
-                {
-                    "pair": ['Text("BinarySearch")', 'Text("Findingitemsfastinsorteddata")'],
-                    "max_overlap_area": 0.1,
-                    "fix_suggestion": "shift(DOWN * 0.1122)",
-                },
-                {
-                    "pair": ['Square[1]', 'Text("1,000items→about10checks")'],
-                    "max_overlap_area": 0.1,
-                    "fix_suggestion": "shift(UP * 0.0950)",
-                },
-                {
-                    "pair": ['Text("Find14")', 'Text("ThedatamustbeSORTEDfirst.")'],
-                    "max_overlap_area": 0.1,
-                    "fix_suggestion": "shift(UP * 0.0602)",
-                },
-            ],
+            "objects": ['Text("Binary Search")', 'Text("Finding items fast in sorted data")'],
+            "start_time": 0.0,
+            "end_time": 2.5,
+            "duration": 2.5,
+            "peak_overlap_area": 0.1182,
+            "peak_centroid": {"x": 0.02, "y": 3.41},
+            "resolution_mtv": {"x": 0.0, "y": 0.1122, "z": 0.0},
+            "fix_suggestion": "shift(UP * 0.1122)",
         }
     )
     dispatcher.close()
     payload = json.loads(buf.getvalue())
     assert payload["scene"] == "BinarySearchExplained"
-    assert len(payload["issues"]) <= 3
-    assert len(buf.getvalue()) / 4 < 200
+    assert len(payload["collision_events"]) == 1
+    event = payload["collision_events"][0]
+    assert event["start_time"] == 0.0
+    assert event["end_time"] == 2.5
+    assert event["peak_centroid"] == {"x": 0.02, "y": 3.41}
+    assert event["peak_overlap_area"] == pytest.approx(0.1182)

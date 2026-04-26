@@ -19,8 +19,6 @@ from manim_vision.telemetry.schema import MANIM_VISION_SPATIAL_REPORT_SCHEMA
 
 logger = logging.getLogger("manim_vision.telemetry")
 
-_TEXT_LABEL_RE = re.compile(r'^Text\("(?P<text>.*)"\)(?:\[\d+\])?$')
-
 
 def _text_block(payload: dict[str, Any], scene_label: str) -> str:
     mtv = payload.get("resolution_mtv") or {}
@@ -44,65 +42,25 @@ def _utc_now() -> str:
     )
 
 
-def _extract_text(label: str) -> str | None:
-    match = _TEXT_LABEL_RE.fullmatch(label)
-    if not match:
-        return None
-    return match.group("text")
+def _round_float(value: Any, digits: int = 4) -> float:
+    """Return a stable float for JSON output and text logs."""
+    return round(float(value), digits)
 
 
-def _is_numeric_text_label(label: str) -> bool:
-    text = _extract_text(label)
-    return bool(text and text.isdigit())
-
-
-def _is_story_text_label(label: str) -> bool:
-    text = _extract_text(label)
-    return bool(text and not text.isdigit() and text not in {"", "Find14"})
-
-
-def _is_array_element(label: str) -> bool:
-    return label.startswith("Square") or _is_numeric_text_label(label)
-
-
-def _is_search_ui_label(label: str) -> bool:
-    text = _extract_text(label)
-    return _is_array_element(label) or text == "Find14"
-
-
-def _is_arrow_label(label: str) -> bool:
-    return label.startswith("Arrow") or label.startswith("ArrowTriangle")
-
-
-def _compact_fix(fix: str) -> str:
-    return fix.replace("shift(", "").replace(")", "")
-
-
-def _issue_key(pair: tuple[str, str]) -> str:
-    a, b = pair
-    labels = (a, b)
-    if all(_is_story_text_label(label) for label in labels):
-        return "title_spacing"
-    if any(_is_arrow_label(label) for label in labels) and any(_is_story_text_label(label) for label in labels):
-        return "marker_vs_text"
-    if any(_is_search_ui_label(label) or label == "VMobjectFromSVGPath" for label in labels) and any(
-        _is_story_text_label(label) for label in labels
-    ):
-        return "stale_search_ui"
-    return stable_pair_key(a, b)
-
-
-def _contains_generic_fragment(pair: tuple[str, str]) -> bool:
-    return any(label in {"VMobjectFromSVGPath", "VectorizedPoint"} for label in pair)
-
-
-def _issue_sort_key(issue_key: str) -> tuple[int, str]:
-    order = {
-        "title_spacing": 0,
-        "marker_vs_text": 1,
-        "stale_search_ui": 2,
-    }
-    return (order.get(issue_key, 99), issue_key)
+def _format_event_text(event: dict[str, Any]) -> str:
+    """Render one collision interval for the human-readable report."""
+    objects = " <-> ".join(event.get("objects") or [])
+    centroid = event.get("peak_centroid") or {}
+    mtv = event.get("resolution_mtv") or {}
+    return (
+        f"- {objects}\n"
+        f"  interval: {event.get('start_time', 0.0):.2f}s -> {event.get('end_time', 0.0):.2f}s"
+        f" ({event.get('duration', 0.0):.2f}s)\n"
+        f"  peak overlap: area={event.get('peak_overlap_area', 0.0):.4f}"
+        f" centroid=({centroid.get('x', 0.0):.4f}, {centroid.get('y', 0.0):.4f})\n"
+        f"  mtv: x={mtv.get('x', 0.0):.4f} y={mtv.get('y', 0.0):.4f} z={mtv.get('z', 0.0):.4f}\n"
+        f"  fix: {event.get('fix_suggestion', '')}"
+    )
 
 
 class TelemetryDispatcher:
@@ -136,7 +94,7 @@ class TelemetryDispatcher:
         self._jsonl_path: Path | None = None
         self._txt_path: Path | None = None
         self._output_mode = output_mode
-        self._summary_reports: list[dict[str, Any]] = []
+        self._collision_events: list[dict[str, Any]] = []
         self._results: dict[str, Any] | None = None
         if output_stream is not None:
             self._json_stream: TextIO = output_stream
@@ -199,17 +157,15 @@ class TelemetryDispatcher:
     @property
     def results(self) -> dict[str, Any] | None:
         """Return the built scene summary after ``close()``, or build it lazily if needed."""
-        if self._results is None and self._summary_reports:
+        if self._results is None and self._collision_events:
             self._results = self._build_scene_summary()
         return self._results
 
     def write_check_digest(self, report: dict[str, Any]) -> None:
         """Record per-check event batches or append them immediately in legacy mode."""
         if self._output_mode in {"llm", "human", "silent"}:
-            ts = report.get("timestamp", _utc_now())
-            body = {**report, "timestamp": ts}
-            self._summary_reports.append(body)
-            self._results = None
+            for event in report.get("collision_events") or []:
+                self.record_collision_event(event)
             return
 
         if not self._owns or self._digest_path is None:
@@ -234,84 +190,42 @@ class TelemetryDispatcher:
             )
             self._text_stream.flush()
 
+    def record_collision_event(self, event: dict[str, Any]) -> None:
+        """Append one finalized collision interval for later output."""
+        centroid = event.get("peak_centroid") or {}
+        mtv = event.get("resolution_mtv") or {}
+        body = {
+            "objects": list(event.get("objects") or []),
+            "start_time": _round_float(event.get("start_time", 0.0), 3),
+            "end_time": _round_float(event.get("end_time", 0.0), 3),
+            "duration": _round_float(event.get("duration", 0.0), 3),
+            "peak_overlap_area": _round_float(event.get("peak_overlap_area", 0.0), 4),
+            "peak_centroid": {
+                "x": _round_float(centroid.get("x", 0.0), 4),
+                "y": _round_float(centroid.get("y", 0.0), 4),
+            },
+            "resolution_mtv": {
+                "x": _round_float(mtv.get("x", 0.0), 4),
+                "y": _round_float(mtv.get("y", 0.0), 4),
+                "z": _round_float(mtv.get("z", 0.0), 4),
+            },
+            "fix_suggestion": str(event.get("fix_suggestion", "")),
+        }
+        self._collision_events.append(body)
+        self._results = None
+
     def _build_scene_summary(self) -> dict[str, Any]:
-        issue_buckets: dict[str, dict[str, Any]] = {}
-        total_events = 0
-        for report in self._summary_reports:
-            for item in report.get("actionable_merged") or []:
-                pair = tuple(item.get("pair") or ())
-                if len(pair) != 2:
-                    continue
-                total_events += 1
-                key = _issue_key(pair)
-                bucket = issue_buckets.setdefault(
-                    key,
-                    {
-                        "key": key,
-                        "pairs": [],
-                        "targets": set(),
-                        "sources": set(),
-                        "samples": [],
-                    },
-                )
-                bucket["pairs"].append(pair)
-                texts = [text for text in (_extract_text(pair[0]), _extract_text(pair[1])) if text]
-                for text in texts:
-                    if text and not text.isdigit():
-                        bucket["targets"].add(text)
-                for label in pair:
-                    bucket["sources"].add(label)
-                bucket["samples"].append(item)
-
-        issues: list[dict[str, Any]] = []
-        for key in sorted(issue_buckets, key=_issue_sort_key):
-            bucket = issue_buckets[key]
-            sample = max(bucket["samples"], key=lambda item: float(item.get("max_overlap_area", 0.0)))
-            if key == "title_spacing":
-                texts = sorted(bucket["targets"])[:2]
-                issues.append(
-                    {
-                        "problem": "title/subtitle overlap",
-                        "objects": texts or list(sample["pair"]),
-                        "fix": sample["fix_suggestion"],
-                    }
-                )
-                continue
-            if key == "marker_vs_text":
-                targets = [text for text in sorted(bucket["targets"]) if text]
-                issues.append(
-                    {
-                        "problem": "pointer tip overlaps intro text",
-                        "objects": targets[:1] or list(sample["pair"]),
-                        "fix": sample["fix_suggestion"],
-                    }
-                )
-                continue
-            if key == "stale_search_ui":
-                targets = [text for text in sorted(bucket["targets"]) if text and text != "Find14"]
-                issues.append(
-                    {
-                        "problem": "old search UI overlaps later sections",
-                        "objects": targets[:4],
-                        "fix": "fade out the array row, index labels, arrows, and the Find 14 label before the later narration, requirement, and ending sections",
-                    }
-                )
-                continue
-
-            if _contains_generic_fragment(sample["pair"]):
-                continue
-            issues.append(
-                {
-                    "problem": "overlap",
-                    "objects": list(sample["pair"]),
-                    "fix": sample["fix_suggestion"],
-                }
-            )
-
+        events = sorted(
+            self._collision_events,
+            key=lambda event: (
+                float(event.get("start_time", 0.0)),
+                float(event.get("end_time", 0.0)),
+                tuple(event.get("objects") or ()),
+            ),
+        )
         return {
             "scene": self._default_scene_name,
-            "events": total_events,
-            "issues": issues,
+            "collision_events": events,
         }
 
     def _write_summary_outputs(self, summary: dict[str, Any]) -> None:
@@ -331,11 +245,10 @@ class TelemetryDispatcher:
                 self._json_stream.flush()
             return
 
-        lines = [f"scene: {summary['scene']}", f"issues: {len(summary['issues'])}"]
-        for issue in summary.get("issues", []):
-            objects = ", ".join(issue.get("objects") or [])
-            lines.append(f"- {issue['problem']}: {objects}")
-            lines.append(f"  fix: {issue['fix']}")
+        events = summary.get("collision_events") or []
+        lines = [f"scene: {summary['scene']}", f"collision_events: {len(events)}"]
+        for event in events:
+            lines.append(_format_event_text(event))
         body = "\n".join(lines) + "\n"
         if self._owns and self._text_stream is not None:
             self._text_stream.write(body)

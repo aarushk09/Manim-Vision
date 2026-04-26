@@ -22,6 +22,7 @@ def _cr_squares_overlap() -> CollisionResult:
         geom_a=a,
         geom_b=b,
         overlap_area=float(inter.area),
+        overlap_centroid=tuple(inter.centroid.coords[0]),
         overlap_geometry=inter,
     )
 
@@ -87,6 +88,7 @@ def test_concave_shape_fallback() -> None:
         geom_a=concave,
         geom_b=square,
         overlap_area=float(inter.area),
+        overlap_centroid=tuple(inter.centroid.coords[0]),
         overlap_geometry=inter,
     )
     solver = ConstraintSolver()

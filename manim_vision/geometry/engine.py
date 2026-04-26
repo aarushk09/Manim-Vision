@@ -43,12 +43,25 @@ class CollisionResult:
     geom_a: shapely.Geometry
     geom_b: shapely.Geometry
     overlap_area: float
+    overlap_centroid: tuple[float, float]
     overlap_geometry: shapely.Geometry
 
 
 def _mobject_label(mobject: VMobject) -> str:
     """Build a stable string label ``ClassName_id`` for telemetry."""
     return f"{type(mobject).__name__}_{id(mobject)}"
+
+
+def _centroid_xy(geometry: shapely.Geometry) -> tuple[float, float] | None:
+    """Return a best-effort centroid in world coordinates for ``geometry``."""
+    try:
+        point = geometry.centroid
+        if point.is_empty:
+            point = geometry.representative_point()
+        x, y = point.coords[0][:2]
+    except (IndexError, TypeError, ValueError, shapely_errors.ShapelyError):
+        return None
+    return (float(x), float(y))
 
 
 class PrecisionGeometryEngine:
@@ -222,6 +235,11 @@ class PrecisionGeometryEngine:
                 if overlap_area <= 0.0:
                     continue
 
+                overlap_centroid = _centroid_xy(overlap_geometry)
+                if overlap_centroid is None:
+                    self._logger.warning("centroid failed for pair (%s, %s)", ka, kb)
+                    continue
+
                 results.append(
                     CollisionResult(
                         mobject_a_id=ka,
@@ -231,6 +249,7 @@ class PrecisionGeometryEngine:
                         geom_a=geom_a,
                         geom_b=geom_b,
                         overlap_area=overlap_area,
+                        overlap_centroid=overlap_centroid,
                         overlap_geometry=overlap_geometry,
                     )
                 )

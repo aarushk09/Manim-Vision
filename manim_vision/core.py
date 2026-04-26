@@ -32,9 +32,9 @@ class ManimVision:
 
         Args:
             scene: The live ``Scene`` instance (typically ``self`` inside ``construct``).
-            output_mode: ``"llm"`` for compact scene summaries, ``"human"`` for readable
-                summaries, or ``"silent"`` to suppress file/stdout output while keeping
-                results available programmatically.
+            output_mode: ``"llm"`` for JSON collision timelines, ``"human"`` for readable
+                interval reports, or ``"silent"`` to suppress file/stdout output while
+                keeping results available programmatically.
 
         Returns:
             The same ``scene`` instance, now with Manim Vision hooks installed.
@@ -89,7 +89,7 @@ class ManimVision:
 
     @classmethod
     def results(cls, scene: Any) -> dict[str, Any] | None:
-        """Return the most recent scene summary accumulated by the dispatcher."""
+        """Return the most recent collision timeline accumulated by the dispatcher."""
         dispatcher = scene.__dict__.get("_self_dispatcher")
         if dispatcher is None:
             return None

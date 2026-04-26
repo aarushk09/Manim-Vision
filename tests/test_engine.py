@@ -31,6 +31,7 @@ def test_collision_detected_on_overlap() -> None:
     hits = eng.check_collisions()
     assert len(hits) == 1
     assert hits[0].overlap_area > 0.0
+    assert len(hits[0].overlap_centroid) == 2
 
 
 def test_touching_boundaries_not_collision() -> None:

@@ -1,6 +1,6 @@
 # Manim Vision
 
-**Manim Vision** adds spatial collision awareness to [Manim Community](https://www.manim.community/) scenes. It watches your scene as `add`, `play`, and `remove` run, detects meaningful overlaps, and emits compact summaries that an LLM can use to fix layout problems without reading video frames.
+**Manim Vision** adds spatial collision awareness to [Manim Community](https://www.manim.community/) scenes. It watches your scene as `add`, `play`, and `remove` run, detects meaningful overlaps, and emits collision timelines that an LLM can use to fix layout problems without reading video frames.
 
 |            | |
 |------------|---|
@@ -13,7 +13,7 @@
 - Hooks a live `Scene` without changing your source class at import time.
 - Converts tracked `VMobject` geometry to Shapely shapes and checks overlap with an `STRtree`.
 - Suppresses obvious noise such as glyph-on-glyph kerning, centered text-in-cell layouts, and tiny dust overlaps.
-- Tracks overlap *events*, so a collision that persists for 100 plays is reported once until the objects separate.
+- Tracks overlap *intervals*, so a collision that persists for 100 plays is reported once with a start time and end time.
 - Labels collisions with scene-meaningful names instead of raw memory ids.
 - Produces a compact scene summary by default, with optional human-readable or silent modes.
 
@@ -53,8 +53,8 @@ class MyScene(Scene):
 
 `ManimVision.monitor(scene, output_mode=...)` accepts one optional mode:
 
-- `"llm"`: default. Collects collision events during the scene and writes one compact JSON summary at shutdown to `media/manim_vision/<SceneName>_check_digest.jsonl`.
-- `"human"`: collects the same events but writes a readable text summary for developers.
+- `"llm"`: default. Collects collision events during the scene and writes one JSON timeline at shutdown to `media/manim_vision/<SceneName>_check_digest.jsonl`.
+- `"human"`: collects the same events but writes a readable interval report for developers.
 - `"silent"`: writes nothing to disk or stdout and keeps results available through `ManimVision.results(scene)`.
 
 Example:
@@ -70,8 +70,8 @@ summary = ManimVision.results(self)
 
 By default, Manim Vision writes under your Manim media directory:
 
-- `media/manim_vision/<SceneName>_check_digest.jsonl`: compact scene summary in LLM mode.
-- `media/manim_vision/<SceneName>_spatial_log.txt`: human summary in human mode.
+- `media/manim_vision/<SceneName>_check_digest.jsonl`: JSON collision timeline in LLM mode.
+- `media/manim_vision/<SceneName>_spatial_log.txt`: human-readable collision timeline in human mode.
 - `media/manim_vision/<SceneName>_spatial.jsonl`: legacy per-event JSONL, only when `MANIM_VISION_PER_PAIR_JSONL=1`.
 
 Override the directory with `MANIM_VISION_REPORT_DIR`.
@@ -94,7 +94,7 @@ Exceptions re-exported from `manim_vision`:
 1. `ManimVision.monitor(scene)` attaches an engine, solver, dispatcher, lock, and worker executor to the live scene instance.
 2. A mixin is inserted at runtime so `add`, `play`, and `remove` can register, resync, and deregister geometry.
 3. Collision checks run on a single-worker background executor under a scene lock.
-4. Raw collisions are filtered, semantically grouped, deduplicated across continuous overlap events, and summarized on shutdown.
+4. Raw collisions are filtered, semantically grouped, tracked as continuous overlap intervals, and flushed on shutdown.
 
 ## Notes
 

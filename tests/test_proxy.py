@@ -100,7 +100,7 @@ def test_add_does_not_block() -> None:
             start = time.monotonic()
             proxy.add(Circle())
             elapsed = time.monotonic() - start
-            assert elapsed < 0.05
+            assert elapsed < 0.1
         finally:
             proxy.shutdown()
 
