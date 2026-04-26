@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from manim import Text
+
 from manim_vision.semantic import SceneSemanticResolver, is_intentional_layout_pair, is_strict_submobject
 
 
@@ -80,3 +82,12 @@ def test_mathtex_labels_use_tex_content() -> None:
     scene = SimpleNamespace(mobjects=[expr])
     resolver = SceneSemanticResolver(scene)
     assert resolver.label(expr) == "MathTex('\\\\log n')"
+
+
+def test_text_components_get_character_labels() -> None:
+    """Tracked text glyphs should be labeled by parent content and character index."""
+    text = Text("AB")
+    scene = SimpleNamespace(mobjects=[text])
+    resolver = SceneSemanticResolver(scene)
+    assert resolver.label(text[0]) == 'Text("AB").char[0]'
+    assert resolver.label(text[1]) == 'Text("AB").char[1]'

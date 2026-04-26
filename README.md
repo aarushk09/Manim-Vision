@@ -16,6 +16,7 @@
 - Tracks overlap *intervals*, so a collision that persists for 100 plays is reported once with a start time and end time.
 - Labels collisions with scene-meaningful names instead of raw memory ids.
 - Produces a compact scene summary by default, with optional human-readable or silent modes.
+- Can replay any monitored scene as a separate collision-overlay video for visual debugging.
 
 ## Installation
 
@@ -66,11 +67,22 @@ ManimVision.shutdown(self)
 summary = ManimVision.results(self)
 ```
 
+To generate a diagnostic overlay video after a run:
+
+```python
+overlay_path = ManimVision.render_overlay(
+    r"C:\path\to\scene.py",
+    "MyScene",
+)
+print(overlay_path)
+```
+
 ## Output files
 
 By default, Manim Vision writes under your Manim media directory:
 
 - `media/manim_vision/<SceneName>_check_digest.jsonl`: JSON collision timeline in LLM mode.
+- `media/manim_vision/<SceneName>_finalcontextcollisionreport.json`: compact LLM-facing report with interned object names and grouped event references.
 - `media/manim_vision/<SceneName>_spatial_log.txt`: human-readable collision timeline in human mode.
 - `media/manim_vision/<SceneName>_spatial.jsonl`: legacy per-event JSONL, only when `MANIM_VISION_PER_PAIR_JSONL=1`.
 
@@ -81,6 +93,7 @@ Override the directory with `MANIM_VISION_REPORT_DIR`.
 - `ManimVision.monitor(scene, output_mode="llm")`
 - `ManimVision.shutdown(scene)`
 - `ManimVision.results(scene)`
+- `ManimVision.render_overlay(scene_or_script, scene_name=None, ...)`
 
 Exceptions re-exported from `manim_vision`:
 

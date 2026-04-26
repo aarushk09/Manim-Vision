@@ -1,4 +1,4 @@
-"""Map low-level mobjects to meaningful scene entities and suppress layout noise."""
+"""Map low-level VMobjects to human-readable collision participants and layout heuristics."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import os
 from collections import Counter
 from typing import Any
 
-# Types whose sub-path overlaps are kerning / anti-alias noise, not layout bugs.
 _TEXT_LIKE_NAMES: frozenset[str] = frozenset(
     {
         "Text",
@@ -32,21 +31,19 @@ def min_reportable_overlap_area() -> float:
 
 
 class SceneSemanticResolver:
-    """Resolve raw mobjects into stable, human-readable scene entities.
-
-    Collision checks happen on leaf SVG paths and group wrappers, but an LLM needs
-    names for the *conceptual* objects involved, not a stream of glyph path ids.
-    """
+    """Resolve tracked collision components into readable, stable scene-local labels."""
 
     def __init__(self, scene: Any) -> None:
         self._scene = scene
         self._family_members = self._collect_scene_family()
         self._ancestor_cache: dict[int, list[Any]] = {}
         self._owner_cache: dict[int, Any] = {}
-        self._base_label_cache: dict[int, str] = {}
-        self._label_cache: dict[int, str] = {}
+        self._owner_base_cache: dict[int, str] = {}
+        self._owner_label_cache: dict[int, str] = {}
+        self._component_label_cache: dict[int, str] = {}
+        self._component_members_cache: dict[int, list[Any]] = {}
         self._owners = self._collect_owners()
-        self._label_counts = Counter(self._base_label(owner) for owner in self._owners)
+        self._owner_label_counts = Counter(self._owner_base_label(owner) for owner in self._owners)
 
     def _collect_scene_family(self) -> list[Any]:
         seen: set[int] = set()
@@ -61,19 +58,7 @@ class SceneSemanticResolver:
             return
         seen.add(key)
         ordered.append(member)
-
-        family_getter = getattr(member, "get_family", None)
-        if callable(family_getter):
-            for relative in family_getter():
-                rel_key = id(relative)
-                if rel_key in seen:
-                    continue
-                seen.add(rel_key)
-                ordered.append(relative)
-                for child in getattr(relative, "submobjects", ()) or ():
-                    self._walk_member(child, seen, ordered)
-
-        for child in getattr(member, "submobjects", ()) or ():
+        for child in list(getattr(member, "submobjects", ()) or ()):
             self._walk_member(child, seen, ordered)
 
     def _collect_owners(self) -> list[Any]:
@@ -101,9 +86,9 @@ class SceneSemanticResolver:
             if mob is member or mob in family:
                 matches.append((len(family), member))
         matches.sort(key=lambda item: item[0])
-        out = [member for _size, member in matches]
-        self._ancestor_cache[key] = out
-        return out
+        ancestors = [member for _size, member in matches]
+        self._ancestor_cache[key] = ancestors
+        return ancestors
 
     def _text_anchor(self, mob: Any) -> Any | None:
         for ancestor in self._ancestors(mob):
@@ -112,14 +97,15 @@ class SceneSemanticResolver:
         return None
 
     def owner(self, mob: Any) -> Any:
-        """Return the representative object for grouping and event lifecycle tracking."""
+        """Return the conceptual owner used for layout heuristics."""
         key = id(mob)
         cached = self._owner_cache.get(key)
         if cached is not None:
             return cached
-        text_anchor = self._text_anchor(mob)
-        if text_anchor is not None:
-            owner = text_anchor
+
+        anchor = self._text_anchor(mob)
+        if anchor is not None:
+            owner = anchor
         else:
             owner = mob
             for ancestor in self._ancestors(mob):
@@ -127,11 +113,139 @@ class SceneSemanticResolver:
                     owner = ancestor
                     break
             if type(owner).__name__ in _GENERIC_LEAF_NAMES:
-                fallback = self._nearest_meaningful_member(owner)
-                if fallback is not None:
-                    owner = fallback
+                scene_root = _scene_root_for(mob, self._scene)
+                if scene_root is not None and type(scene_root).__name__ not in _GENERIC_LEAF_NAMES:
+                    owner = scene_root
         self._owner_cache[key] = owner
         return owner
+
+    def _owner_base_label(self, owner: Any) -> str:
+        key = id(owner)
+        cached = self._owner_base_cache.get(key)
+        if cached is not None:
+            return cached
+
+        if type(owner).__name__ in _TEXT_LIKE_NAMES:
+            label = _label_textish(owner)
+        else:
+            given_name = str(getattr(owner, "name", "") or "").strip()
+            if given_name and given_name != type(owner).__name__:
+                label = given_name
+            else:
+                context = self._tile_context(owner)
+                cls = type(owner).__name__
+                if context is not None:
+                    label = f"{cls} for {context}"
+                elif cls in _GENERIC_LEAF_NAMES:
+                    nearby = self._nearest_context_label(owner)
+                    if nearby is not None:
+                        label = f"Path near {nearby}"
+                    else:
+                        center = getattr(owner, "get_center", lambda: (0.0, 0.0, 0.0))()
+                        label = f"Path@({float(center[0]):.2f},{float(center[1]):.2f})"
+                else:
+                    label = cls
+
+        self._owner_base_cache[key] = label
+        return label
+
+    def _owner_label(self, owner: Any) -> str:
+        key = id(owner)
+        cached = self._owner_label_cache.get(key)
+        if cached is not None:
+            return cached
+
+        base = self._owner_base_label(owner)
+        if self._owner_label_counts[base] <= 1:
+            label = base
+        else:
+            peers = [peer for peer in self._owners if self._owner_base_label(peer) == base]
+            ordinal = next(i for i, peer in enumerate(peers, start=1) if peer is owner)
+            label = f"{base}[{ordinal}]"
+
+        self._owner_label_cache[key] = label
+        return label
+
+    def _component_members(self, owner: Any) -> list[Any]:
+        key = id(owner)
+        cached = self._component_members_cache.get(key)
+        if cached is not None:
+            return cached
+
+        members: list[Any] = []
+        seen: set[int] = set()
+        for member in self._family_members:
+            if self.owner(member) is not owner:
+                continue
+            if not _is_component_leaf(member):
+                continue
+            member_key = id(member)
+            if member_key in seen:
+                continue
+            seen.add(member_key)
+            members.append(member)
+        if not members:
+            members = [owner]
+        self._component_members_cache[key] = members
+        return members
+
+    def _component_index(self, owner: Any, mob: Any) -> int:
+        members = self._component_members(owner)
+        return next(index for index, member in enumerate(members) if member is mob)
+
+    def _component_role(self, owner: Any) -> str:
+        name = type(owner).__name__
+        if name in {"Text", "MarkupText"}:
+            return "char"
+        if name in {"MathTex", "Tex", "SingleStringMathTex"}:
+            return "glyph"
+        return "part"
+
+    def label(self, mob: Any) -> str:
+        """Return a unique, readable label for the tracked collision component ``mob``."""
+        key = id(mob)
+        cached = self._component_label_cache.get(key)
+        if cached is not None:
+            return cached
+
+        owner = self.owner(mob)
+        owner_label = self._owner_label(owner)
+        members = self._component_members(owner)
+        if len(members) == 1 and members[0] is owner:
+            label = owner_label
+        elif mob in members:
+            label = f"{owner_label}.{self._component_role(owner)}[{self._component_index(owner, mob)}]"
+        else:
+            label = owner_label
+
+        self._component_label_cache[key] = label
+        return label
+
+    def pair_labels(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
+        """Return a deterministic ordered label pair for human and machine output."""
+        return tuple(sorted((self.label(mob_a), self.label(mob_b))))
+
+    def event_key(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
+        """Stable event key based on component labels."""
+        return self.pair_labels(mob_a, mob_b)
+
+    def is_pair_internal_glyphs_same_text(self, mob_a: Any, mob_b: Any) -> bool:
+        """True if both sides are different paths under the same text-like object."""
+        owner_a = self.owner(mob_a)
+        owner_b = self.owner(mob_b)
+        return owner_a is owner_b and type(owner_a).__name__ in _TEXT_LIKE_NAMES
+
+    def is_intentional_layout_pair(self, mob_a: Any, mob_b: Any) -> bool:
+        """Skip overlaps that are part of a composite object, not a real layout bug."""
+        owner_a = self.owner(mob_a)
+        owner_b = self.owner(mob_b)
+        if _is_empty_text_like(owner_a) or _is_empty_text_like(owner_b):
+            return True
+        if is_strict_submobject(owner_a, owner_b) or is_strict_submobject(owner_b, owner_a):
+            return True
+        if _is_centered_text_in_shape(owner_a, owner_b) or _is_centered_text_in_shape(owner_b, owner_a):
+            return True
+        return _sibling_shape_with_text_tiles(owner_a, owner_b, self._scene)
 
     def _tile_context(self, mob: Any) -> str | None:
         for ancestor in self._ancestors(mob):
@@ -153,111 +267,31 @@ class SceneSemanticResolver:
             return _label_textish(self.owner(text_children[0]))
         return None
 
-    def _base_label(self, mob: Any) -> str:
-        owner = self.owner(mob)
-        key = id(owner)
-        cached = self._base_label_cache.get(key)
-        if cached is not None:
-            return cached
-
-        if type(owner).__name__ in _TEXT_LIKE_NAMES:
-            label = _label_textish(owner)
-        elif type(owner).__name__ in _GENERIC_LEAF_NAMES:
-            label = self._generic_fallback_label(owner)
-        else:
-            given_name = str(getattr(owner, "name", "") or "").strip()
-            if given_name and given_name != type(owner).__name__:
-                label = given_name
-            else:
-                context = self._tile_context(owner)
-                cls = type(owner).__name__
-                label = f"{cls} for {context}" if context is not None else cls
-
-        self._base_label_cache[key] = label
-        return label
-
-    def label(self, mob: Any) -> str:
-        """Return a unique, human-readable label for ``mob`` within the current scene."""
-        owner = self.owner(mob)
-        key = id(owner)
-        cached = self._label_cache.get(key)
-        if cached is not None:
-            return cached
-
-        base = self._base_label(owner)
-        if self._label_counts[base] <= 1:
-            label = base
-        else:
-            peers = [peer for peer in self._owners if self._base_label(peer) == base]
-            ordinal = next(i for i, peer in enumerate(peers, start=1) if peer is owner)
-            label = f"{base}[{ordinal}]"
-
-        self._label_cache[key] = label
-        return label
-
-    def pair_labels(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
-        """Return a deterministic ordered label pair for human and LLM output."""
-        return tuple(sorted((self.label(mob_a), self.label(mob_b))))
-
-    def event_key(self, mob_a: Any, mob_b: Any) -> tuple[str, str]:
-        """Stable event key based on semantic labels, not transient fragment ids."""
-        return self.pair_labels(mob_a, mob_b)
-
-    def is_pair_internal_glyphs_same_text(self, mob_a: Any, mob_b: Any) -> bool:
-        """True if both sides are different paths under the same text object."""
-        ta = self._text_anchor(mob_a)
-        if ta is None:
-            return False
-        tb = self._text_anchor(mob_b)
-        return tb is ta
-
-    def is_intentional_layout_pair(self, mob_a: Any, mob_b: Any) -> bool:
-        """Skip overlaps that are part of a composite object, not a scene bug."""
-        owner_a = self.owner(mob_a)
-        owner_b = self.owner(mob_b)
-        if _is_empty_text_like(owner_a) or _is_empty_text_like(owner_b):
-            return True
-        if is_strict_submobject(owner_a, owner_b) or is_strict_submobject(owner_b, owner_a):
-            return True
-        if _is_centered_text_in_shape(owner_a, owner_b) or _is_centered_text_in_shape(owner_b, owner_a):
-            return True
-        return _sibling_shape_with_text_tiles(owner_a, owner_b, self._scene)
-
-    def _generic_fallback_label(self, mob: Any) -> str:
-        """Name a raw SVG fragment by its closest meaningful neighbor in the scene."""
-        nearest = self._nearest_meaningful_owner(mob)
-        if nearest is not None:
-            return f"fragment near {self._base_label(nearest)}"
-        x, y = _center_xy(mob)
-        return f"{type(mob).__name__} at ({x:.2f}, {y:.2f})"
-
-    def _nearest_meaningful_member(self, mob: Any) -> Any | None:
-        origin_x, origin_y = _center_xy(mob)
-        best_member = None
-        best_distance = float("inf")
-        for member in self._family_members:
-            if member is mob or type(member).__name__ in _GENERIC_LEAF_NAMES:
+    def _nearest_context_label(self, mob: Any) -> str | None:
+        center_getter = getattr(mob, "get_center", None)
+        if not callable(center_getter):
+            return None
+        center = center_getter()
+        best_label: str | None = None
+        best_distance: float | None = None
+        for root in list(self._scene.mobjects):
+            if root is mob:
                 continue
-            x, y = _center_xy(member)
-            distance = (x - origin_x) ** 2 + (y - origin_y) ** 2
-            if distance < best_distance:
-                best_distance = distance
-                best_member = member
-        return best_member
-
-    def _nearest_meaningful_owner(self, mob: Any) -> Any | None:
-        origin_x, origin_y = _center_xy(mob)
-        best_owner = None
-        best_distance = float("inf")
-        for owner in getattr(self, "_owners", ()):
-            if owner is mob or type(owner).__name__ in _GENERIC_LEAF_NAMES:
+            candidate_owner = self.owner(root)
+            candidate_label = self._owner_base_label(candidate_owner)
+            if candidate_label in {"VGroup", type(mob).__name__}:
                 continue
-            x, y = _center_xy(owner)
-            distance = (x - origin_x) ** 2 + (y - origin_y) ** 2
-            if distance < best_distance:
+            candidate_center_getter = getattr(candidate_owner, "get_center", None)
+            if not callable(candidate_center_getter):
+                continue
+            candidate_center = candidate_center_getter()
+            dx = float(candidate_center[0]) - float(center[0])
+            dy = float(candidate_center[1]) - float(center[1])
+            distance = (dx * dx) + (dy * dy)
+            if best_distance is None or distance < best_distance:
                 best_distance = distance
-                best_owner = owner
-        return best_owner
+                best_label = candidate_label
+        return best_label
 
 
 def _scene_root_for(mob: Any, scene: Any) -> Any | None:
@@ -279,25 +313,25 @@ def is_pair_internal_glyphs_same_text(mob_a: Any, mob_b: Any, scene: Any) -> boo
 
 
 def semantic_label(mob: Any, scene: Any) -> str:
-    """Broad label: whole Text / Math string when possible, else a stable scene-local label."""
+    """Broad label: scene-local component label with text content when available."""
     return SceneSemanticResolver(scene).label(mob)
 
 
-def _label_textish(m: Any) -> str:
-    cls = type(m).__name__
+def _label_textish(mob: Any) -> str:
+    cls = type(mob).__name__
     if cls in ("Text", "MarkupText"):
-        text = getattr(m, "original_text", None)
+        text = getattr(mob, "original_text", None)
         if text is None:
-            text = getattr(m, "text", None)
+            text = getattr(mob, "text", None)
         if text is not None:
             value = str(text).replace("\n", " ").strip()
             if len(value) > 56:
                 value = value[:53] + "..."
             return f'{cls}("{value}")'
     if cls in ("MathTex", "Tex", "SingleStringMathTex"):
-        tex = getattr(m, "tex_string", None)
+        tex = getattr(mob, "tex_string", None)
         if tex is None:
-            tex = getattr(m, "tex", None)
+            tex = getattr(mob, "tex", None)
         if tex is not None:
             value = str(tex).replace("\n", " ").strip()
             if len(value) > 56:
@@ -345,6 +379,7 @@ def _is_centered_text_in_shape(shape: Any, text: Any) -> bool:
 
 
 def stable_pair_key(label_a: str, label_b: str) -> str:
+    """Return a deterministic key for an unordered pair of semantic labels."""
     a, b = sorted((label_a, label_b))
     return f"{a}<->{b}"
 
@@ -388,22 +423,21 @@ def _sibling_shape_with_text_tiles(mob_a: Any, mob_b: Any, scene: Any) -> bool:
     a_name, b_name = type(mob_a).__name__, type(mob_b).__name__
     for root in list(scene.mobjects):
         for group in root.get_family():
-            if type(group).__name__ != "VGroup" or not group.submobjects:
+            if type(group).__name__ != "VGroup" or not getattr(group, "submobjects", None):
                 continue
             if mob_a in group.submobjects and mob_b in group.submobjects:
-                st = {a_name, b_name}
-                if st & _SHAPE_TILE and st & _LABEL_IN_CELL and len(group.submobjects) <= 6:
+                names = {a_name, b_name}
+                if names & _SHAPE_TILE and names & _LABEL_IN_CELL and len(group.submobjects) <= 6:
                     return True
     return False
 
 
-def _center_xy(mob: Any) -> tuple[float, float]:
-    """Best-effort 2D center for semantic labeling heuristics."""
-    getter = getattr(mob, "get_center", None)
-    if callable(getter):
-        try:
-            center = getter()
-            return (float(center[0]), float(center[1]))
-        except Exception:
-            pass
-    return (0.0, 0.0)
+def _is_component_leaf(mob: Any) -> bool:
+    children = list(getattr(mob, "submobjects", ()) or ())
+    if children:
+        return False
+    points = getattr(mob, "points", None)
+    try:
+        return points is not None and len(points) >= 2
+    except TypeError:
+        return False

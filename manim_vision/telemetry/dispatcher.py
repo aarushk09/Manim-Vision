@@ -18,6 +18,7 @@ from manim_vision.telemetry.paths import check_digest_path_next_to_spatial_jsonl
 from manim_vision.telemetry.schema import MANIM_VISION_SPATIAL_REPORT_SCHEMA
 
 logger = logging.getLogger("manim_vision.telemetry")
+_COMPONENT_SUFFIX_RE = re.compile(r"\.(?:char|glyph|part)\[\d+\]$")
 
 
 def _text_block(payload: dict[str, Any], scene_label: str) -> str:
@@ -63,6 +64,225 @@ def _format_event_text(event: dict[str, Any]) -> str:
     )
 
 
+def _event_sort_key(event: dict[str, Any]) -> tuple[float, float, tuple[str, ...]]:
+    return (
+        float(event.get("start_time", 0.0)),
+        float(event.get("end_time", 0.0)),
+        tuple(event.get("objects") or ()),
+    )
+
+
+def _partner_for_anchor(event: dict[str, Any], anchor: str) -> str | None:
+    objects = list(event.get("objects") or [])
+    if len(objects) != 2 or anchor not in objects:
+        return None
+    return objects[1] if objects[0] == anchor else objects[0]
+
+
+def _group_object_label(label: str) -> str:
+    return _COMPONENT_SUFFIX_RE.sub("", label)
+
+
+def _build_collision_groups(events: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    indexed_events = list(enumerate(events))
+    anchor_to_events: dict[str, list[tuple[int, dict[str, Any]]]] = {}
+    for index, event in indexed_events:
+        for obj in (_group_object_label(obj) for obj in (event.get("objects") or [])):
+            anchor_to_events.setdefault(obj, []).append((index, event))
+
+    candidates: list[tuple[str, int, int, float]] = []
+    for anchor, anchor_events in anchor_to_events.items():
+        partners = {
+            partner
+            for _index, event in anchor_events
+            if (partner := _partner_for_anchor(
+                {"objects": [_group_object_label(obj) for obj in (event.get("objects") or [])]},
+                anchor,
+            )) is not None
+        }
+        if len(partners) < 2:
+            continue
+        first_seen = min(float(event.get("start_time", 0.0)) for _index, event in anchor_events)
+        candidates.append((anchor, len(partners), len(anchor_events), first_seen))
+
+    candidates.sort(key=lambda item: (-item[1], -item[2], item[3], item[0]))
+
+    unassigned = {index for index, _event in indexed_events}
+    groups: list[dict[str, Any]] = []
+
+    for anchor, _partner_count, _event_count, _first_seen in candidates:
+        available = [(index, event) for index, event in anchor_to_events[anchor] if index in unassigned]
+        partner_map: dict[str, list[dict[str, Any]]] = {}
+        for index, event in available:
+            partner = _partner_for_anchor(
+                {"objects": [_group_object_label(obj) for obj in (event.get("objects") or [])]},
+                anchor,
+            )
+            if partner is None:
+                continue
+            partner_map.setdefault(partner, []).append(event)
+        if len(partner_map) < 2:
+            continue
+
+        members = []
+        consumed: set[int] = set()
+        for partner, partner_events in sorted(
+            partner_map.items(),
+            key=lambda item: (_event_sort_key(item[1][0]), item[0]),
+        ):
+            ordered_partner_events = sorted(partner_events, key=_event_sort_key)
+            members.append(
+                {
+                    "object": partner,
+                    "events": ordered_partner_events,
+                }
+            )
+            consumed.update(
+                index
+                for index, event in available
+                if _partner_for_anchor(
+                    {"objects": [_group_object_label(obj) for obj in (event.get("objects") or [])]},
+                    anchor,
+                )
+                == partner
+            )
+
+        groups.append(
+            {
+                "kind": "anchor",
+                "anchor": anchor,
+                "objects": [anchor, *[member["object"] for member in members]],
+                "partner_count": len(members),
+                "event_count": sum(len(member["events"]) for member in members),
+                "members": members,
+            }
+        )
+        unassigned.difference_update(consumed)
+
+    pair_map: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for index in sorted(unassigned, key=lambda item: _event_sort_key(events[item])):
+        event = events[index]
+        broad_objects = sorted(_group_object_label(obj) for obj in (event.get("objects") or []))
+        pair_map.setdefault(tuple(broad_objects), []).append(event)
+
+    for broad_pair, pair_events in pair_map.items():
+        groups.append(
+            {
+                "kind": "pair",
+                "objects": list(broad_pair),
+                "event_count": len(pair_events),
+                "events": pair_events,
+            }
+        )
+
+    return groups
+
+
+def _format_group_text(group: dict[str, Any]) -> str:
+    if group.get("kind") == "anchor":
+        lines = [
+            f"* anchor: {group.get('anchor', '')}",
+            f"  partners: {group.get('partner_count', 0)}  events: {group.get('event_count', 0)}",
+        ]
+        for member in group.get("members") or []:
+            lines.append(f"  with {member.get('object', '')}")
+            for event in member.get("events") or []:
+                lines.append("    " + _format_event_text(event).replace("\n", "\n    "))
+        return "\n".join(lines)
+
+    event = (group.get("events") or [{}])[0]
+    return _format_event_text(event)
+
+
+def _build_final_context_report(summary: dict[str, Any]) -> dict[str, Any]:
+    events = list(summary.get("collision_events") or [])
+    groups = list(summary.get("collision_groups") or [])
+
+    object_labels: list[str] = []
+    object_index: dict[str, int] = {}
+
+    def intern_object(label: str) -> int:
+        if label not in object_index:
+            object_index[label] = len(object_labels)
+            object_labels.append(label)
+        return object_index[label]
+
+    broad_labels: list[str] = []
+    broad_index: dict[str, int] = {}
+
+    def intern_broad(label: str) -> int:
+        if label not in broad_index:
+            broad_index[label] = len(broad_labels)
+            broad_labels.append(label)
+        return broad_index[label]
+
+    event_rows: list[list[Any]] = []
+    event_ids: dict[tuple[Any, ...], int] = {}
+    for event in events:
+        objects = list(event.get("objects") or [])
+        centroid = event.get("peak_centroid") or {}
+        row = [
+            intern_object(objects[0]),
+            intern_object(objects[1]),
+            event.get("start_time", 0.0),
+            event.get("end_time", 0.0),
+            centroid.get("x", 0.0),
+            centroid.get("y", 0.0),
+            event.get("peak_overlap_area", 0.0),
+        ]
+        event_ids[tuple(row)] = len(event_rows)
+        event_rows.append(row)
+
+    group_rows: list[Any] = []
+    for group in groups:
+        if group.get("kind") == "anchor":
+            members = []
+            for member in group.get("members") or []:
+                member_events = []
+                for event in member.get("events") or []:
+                    centroid = event.get("peak_centroid") or {}
+                    key = (
+                        intern_object((event.get("objects") or ["", ""])[0]),
+                        intern_object((event.get("objects") or ["", ""])[1]),
+                        event.get("start_time", 0.0),
+                        event.get("end_time", 0.0),
+                        centroid.get("x", 0.0),
+                        centroid.get("y", 0.0),
+                        event.get("peak_overlap_area", 0.0),
+                    )
+                    member_events.append(event_ids[key])
+                members.append([intern_broad(member.get("object", "")), member_events])
+            group_rows.append(["a", intern_broad(group.get("anchor", "")), members])
+            continue
+
+        pair_event_ids = []
+        for event in group.get("events") or []:
+            centroid = event.get("peak_centroid") or {}
+            key = (
+                intern_object((event.get("objects") or ["", ""])[0]),
+                intern_object((event.get("objects") or ["", ""])[1]),
+                event.get("start_time", 0.0),
+                event.get("end_time", 0.0),
+                centroid.get("x", 0.0),
+                centroid.get("y", 0.0),
+                event.get("peak_overlap_area", 0.0),
+            )
+            pair_event_ids.append(event_ids[key])
+        broad_objects = list(group.get("objects") or [])
+        group_rows.append(
+            ["p", intern_broad(broad_objects[0]), intern_broad(broad_objects[1]), pair_event_ids]
+        )
+
+    return {
+        "fmt": "v1 B=broad labels; O=object labels; E=[o1,o2,t0,t1,x,y,a]; G=['a',anchor,[[partner,[event ids]]...]] or ['p',left,right,[event ids]]",
+        "scene": summary.get("scene", "UnknownScene"),
+        "B": broad_labels,
+        "O": object_labels,
+        "E": event_rows,
+        "G": group_rows,
+    }
+
+
 class TelemetryDispatcher:
     """Serializes collision telemetry to files (and optional stdout) after schema validation."""
 
@@ -90,6 +310,7 @@ class TelemetryDispatcher:
         self._text_stream: TextIO | None = None
         self._digest_stream: TextIO | None = None
         self._digest_path: Path | None = None
+        self._final_context_path: Path | None = None
         self._owns = False
         self._jsonl_path: Path | None = None
         self._txt_path: Path | None = None
@@ -114,6 +335,9 @@ class TelemetryDispatcher:
             Path(check_digest_path)
             if check_digest_path is not None
             else check_digest_path_next_to_spatial_jsonl(self._jsonl_path)
+        )
+        self._final_context_path = self._jsonl_path.with_name(
+            f"{scene_name}_finalcontextcollisionreport.json"
         )
         if self._output_mode == "silent":
             self._json_stream = sys.stdout
@@ -160,6 +384,11 @@ class TelemetryDispatcher:
         if self._results is None and self._collision_events:
             self._results = self._build_scene_summary()
         return self._results
+
+    @property
+    def final_context_path(self) -> Path | None:
+        """Compressed LLM-facing report path when using default file output."""
+        return self._final_context_path
 
     def write_check_digest(self, report: dict[str, Any]) -> None:
         """Record per-check event batches or append them immediately in legacy mode."""
@@ -210,6 +439,8 @@ class TelemetryDispatcher:
                 "z": _round_float(mtv.get("z", 0.0), 4),
             },
             "fix_suggestion": str(event.get("fix_suggestion", "")),
+            "peak_geometry": event.get("peak_geometry") or {"polygons": []},
+            "samples": list(event.get("samples") or []),
         }
         self._collision_events.append(body)
         self._results = None
@@ -217,15 +448,12 @@ class TelemetryDispatcher:
     def _build_scene_summary(self) -> dict[str, Any]:
         events = sorted(
             self._collision_events,
-            key=lambda event: (
-                float(event.get("start_time", 0.0)),
-                float(event.get("end_time", 0.0)),
-                tuple(event.get("objects") or ()),
-            ),
+            key=_event_sort_key,
         )
         return {
             "scene": self._default_scene_name,
             "collision_events": events,
+            "collision_groups": _build_collision_groups(events),
         }
 
     def _write_summary_outputs(self, summary: dict[str, Any]) -> None:
@@ -240,15 +468,26 @@ class TelemetryDispatcher:
                     self._digest_stream = self._digest_path.open("w", encoding="utf-8")
                 self._digest_stream.write(payload + "\n")
                 self._digest_stream.flush()
+                if self._final_context_path is not None:
+                    compact = _build_final_context_report(summary)
+                    self._final_context_path.write_text(
+                        json.dumps(compact, ensure_ascii=False, separators=(",", ":")) + "\n",
+                        encoding="utf-8",
+                    )
             else:
                 self._json_stream.write(payload + "\n")
                 self._json_stream.flush()
             return
 
         events = summary.get("collision_events") or []
-        lines = [f"scene: {summary['scene']}", f"collision_events: {len(events)}"]
-        for event in events:
-            lines.append(_format_event_text(event))
+        groups = summary.get("collision_groups") or []
+        lines = [
+            f"scene: {summary['scene']}",
+            f"collision_events: {len(events)}",
+            f"collision_groups: {len(groups)}",
+        ]
+        for group in groups:
+            lines.append(_format_group_text(group))
         body = "\n".join(lines) + "\n"
         if self._owns and self._text_stream is not None:
             self._text_stream.write(body)

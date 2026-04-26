@@ -1,4 +1,4 @@
-"""Register the full mobject *family* so submobjects (not only group roots) are tracked."""
+"""Register the lowest meaningful drawable VMobject components for collision checks."""
 
 from __future__ import annotations
 
@@ -7,66 +7,88 @@ from typing import TYPE_CHECKING, Any, Iterator
 if TYPE_CHECKING:
     from manim_vision.geometry.engine import PrecisionGeometryEngine
 
-_TEXT_LIKE_NAMES = frozenset({"Text", "MarkupText", "MathTex", "Tex", "SingleStringMathTex"})
-_SKIPPED_INTERNAL_TYPES = frozenset({"VMobjectFromSVGPath", "VectorizedPoint"})
+_SKIPPED_INTERNAL_TYPES = frozenset({"VectorizedPoint"})
 
 
-def _text_ancestor_for(member: Any, root: Any) -> Any | None:
-    for ancestor in root.get_family():
-        if type(ancestor).__name__ not in _TEXT_LIKE_NAMES:
-            continue
-        family_getter = getattr(ancestor, "get_family", None)
-        family = family_getter() if callable(family_getter) else (ancestor,)
-        if member is ancestor or member in family:
-            return ancestor
-    return None
+def _is_drawable_component(member: Any) -> bool:
+    """Return whether ``member`` has enough point data to be visually meaningful."""
+    points = getattr(member, "points", None)
+    try:
+        return points is not None and len(points) >= 2
+    except TypeError:
+        return False
 
 
 def iter_trackable_family_members(root: Any) -> Iterator[Any]:
-    """Yield only the family members that are useful collision participants.
+    """Yield the deepest drawable VMobjects that correspond to visible scene parts.
 
-    Generic internal SVG path fragments and vectorized points create massive noise
-    for composite objects. We keep text glyph geometry because text roots have no
-    points of their own, but skip other internal fragments unless the user added
-    them directly as the root object.
+    The collision system should operate on visual components such as individual text
+    characters, MathTex glyph paths, or members of a ``VGroup``. We therefore recurse
+    until we hit drawable leaves, and only fall back to the parent object when a branch
+    has no drawable descendants of its own.
     """
     from manim.mobject.types.vectorized_mobject import VMobject
 
     seen: set[int] = set()
-    for member in root.get_family():
+
+    def visit(member: Any) -> Iterator[Any]:
         if not isinstance(member, VMobject):
-            continue
-        name = type(member).__name__
-        if name == "VectorizedPoint":
-            continue
-        if member is not root and name == "VMobjectFromSVGPath" and _text_ancestor_for(member, root) is None:
-            continue
-        key = id(member)
-        if key in seen:
-            continue
-        seen.add(key)
-        yield member
+            return
+        if getattr(member, "_manim_vision_ignore", False):
+            return
+        if type(member).__name__ in _SKIPPED_INTERNAL_TYPES:
+            return
+
+        children = [
+            child
+            for child in list(getattr(member, "submobjects", ()) or ())
+            if isinstance(child, VMobject) and type(child).__name__ not in _SKIPPED_INTERNAL_TYPES
+        ]
+
+        yielded_child = False
+        for child in children:
+            child_yielded = False
+            for descendant in visit(child):
+                child_yielded = True
+                yielded_child = True
+                yield descendant
+            if not child_yielded and _is_drawable_component(child):
+                key = id(child)
+                if key not in seen:
+                    seen.add(key)
+                    yielded_child = True
+                    yield child
+
+        if yielded_child:
+            return
+
+        if _is_drawable_component(member):
+            key = id(member)
+            if key not in seen:
+                seen.add(key)
+                yield member
+
+    yield from visit(root)
 
 
 def register_mobject_families_in_engine(root: Any, engine: Any) -> None:
-    """Register every :class:`VMobject` in ``root.get_family()``.
-
-    The *root* instance passed to :meth:`~manim.scene.scene.Scene.add` is wrapped in
-    :class:`ManimVisionMobjectProxy` so that ``deepcopy``-safe engine state stays on the
-    proxy; all other family members are registered on the engine directly, because
-    :class:`Scene` and parents still hold the original mobject references (submobject
-    transforms never touch the group proxy on the way down).
-    """
+    """Register every trackable component of ``root`` in the geometry engine."""
     from manim_vision.proxy.mobject_proxy import ManimVisionMobjectProxy
 
+    proxy_attached = False
     for member in iter_trackable_family_members(root):
-        if member is root:
+        if member is root and not proxy_attached:
             ManimVisionMobjectProxy(member, engine)
+            proxy_attached = True
         else:
             engine.register(member)
+    if root is not None and not proxy_attached:
+        # Even if ``root`` itself is not a collision participant, its transforms still need
+        # to trigger engine resyncs for any registered descendants.
+        ManimVisionMobjectProxy(root, engine)
 
 
 def deregister_mobject_families_from_engine(root: Any, engine: Any) -> None:
-    """Deregister all :class:`VMobject` in ``root.get_family()`` from the engine."""
+    """Deregister all tracked drawable components under ``root`` from the engine."""
     for member in iter_trackable_family_members(root):
         engine.deregister(member)

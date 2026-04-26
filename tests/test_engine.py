@@ -5,10 +5,10 @@ from __future__ import annotations
 import logging
 
 import pytest
-from manim import RIGHT, Circle, Mobject, Square, VGroup
+from manim import RIGHT, Circle, Mobject, Rectangle, Square, Text, VGroup
 
 from manim_vision.geometry.engine import PrecisionGeometryEngine
-from manim_vision.geometry.registration import register_mobject_families_in_engine
+from manim_vision.geometry.registration import iter_trackable_family_members, register_mobject_families_in_engine
 
 
 def test_no_collision_on_separated_objects() -> None:
@@ -90,6 +90,27 @@ def test_vgroup_family_registers_submobjects_and_detects_overlap() -> None:
     assert id(a) in eng._registry and id(b) in eng._registry
     hits = eng.check_collisions()
     assert len(hits) >= 1
+
+
+def test_text_registers_each_character_as_separate_component() -> None:
+    """A ``Text`` object should contribute one tracked component per visible character."""
+    text = Text("AB")
+    components = list(iter_trackable_family_members(text))
+    assert len(components) == 2
+    assert all(type(component).__name__ == "VMobjectFromSVGPath" for component in components)
+
+
+def test_known_group_overlap_scene_matches_human_collision_count() -> None:
+    """A wide rectangle covering two grouped squares should yield exactly two overlaps."""
+    eng = PrecisionGeometryEngine()
+    left = Square(side_length=1.0).shift([-0.75, 0.0, 0.0])
+    right = Square(side_length=1.0).shift([0.75, 0.0, 0.0])
+    pair = VGroup(left, right)
+    sweep = Rectangle(width=2.2, height=0.8)
+    register_mobject_families_in_engine(pair, eng)
+    eng.register(sweep)
+    hits = eng.check_collisions()
+    assert len(hits) == 2
 
 
 def test_register_empty_mobject_logs_debug_not_warning(

@@ -183,3 +183,126 @@ def test_llm_summary_mode_flushes_collision_timeline() -> None:
     assert event["end_time"] == 2.5
     assert event["peak_centroid"] == {"x": 0.02, "y": 3.41}
     assert event["peak_overlap_area"] == pytest.approx(0.1182)
+
+
+def test_llm_summary_groups_shared_anchor_collisions() -> None:
+    """Objects that collide with multiple partners should appear as one anchor group."""
+    buf = io.StringIO()
+    dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="GroupedScene", output_mode="llm")
+    for partner in ("B", "C"):
+        dispatcher.record_collision_event(
+            {
+                "objects": ["A", partner],
+                "start_time": 1.0 if partner == "B" else 2.0,
+                "end_time": 1.5 if partner == "B" else 2.5,
+                "duration": 0.5,
+                "peak_overlap_area": 0.1,
+                "peak_centroid": {"x": 0.0, "y": 0.0},
+                "resolution_mtv": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "fix_suggestion": "# noop",
+            }
+        )
+    dispatcher.close()
+    payload = json.loads(buf.getvalue())
+    groups = payload["collision_groups"]
+    assert len(groups) == 1
+    assert groups[0]["kind"] == "anchor"
+    assert groups[0]["anchor"] == "A"
+    assert [member["object"] for member in groups[0]["members"]] == ["B", "C"]
+
+
+def test_llm_summary_keeps_unshared_pairs_as_standalone_groups() -> None:
+    """Pairs with no shared anchor should remain as pair groups instead of disappearing."""
+    buf = io.StringIO()
+    dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="PairScene", output_mode="llm")
+    for objects in (["A", "B"], ["C", "D"]):
+        dispatcher.record_collision_event(
+            {
+                "objects": objects,
+                "start_time": 0.0,
+                "end_time": 1.0,
+                "duration": 1.0,
+                "peak_overlap_area": 0.1,
+                "peak_centroid": {"x": 0.0, "y": 0.0},
+                "resolution_mtv": {"x": 0.0, "y": 0.0, "z": 0.0},
+                "fix_suggestion": "# noop",
+            }
+        )
+    dispatcher.close()
+    payload = json.loads(buf.getvalue())
+    groups = payload["collision_groups"]
+    assert [group["kind"] for group in groups] == ["pair", "pair"]
+    assert [group["objects"] for group in groups] == [["A", "B"], ["C", "D"]]
+
+
+def test_human_summary_writes_grouped_anchor_sections(tmp_path) -> None:
+    """Human mode should render recurring anchors as grouped log sections."""
+    dispatcher = TelemetryDispatcher(
+        jsonl_path=tmp_path / "scene.jsonl",
+        text_path=tmp_path / "scene.txt",
+        scene_name="HumanGrouped",
+        output_mode="human",
+    )
+    try:
+        for partner in ("B", "C"):
+            dispatcher.record_collision_event(
+                {
+                    "objects": ["A", partner],
+                    "start_time": 0.0,
+                    "end_time": 1.0,
+                    "duration": 1.0,
+                    "peak_overlap_area": 0.1,
+                    "peak_centroid": {"x": 0.0, "y": 0.0},
+                    "resolution_mtv": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "fix_suggestion": "# noop",
+                }
+            )
+    finally:
+        dispatcher.close()
+    text = (tmp_path / "scene.txt").read_text(encoding="utf-8")
+    assert "anchor: A" in text
+    assert "with B" in text
+    assert "with C" in text
+
+
+def test_llm_file_mode_writes_parseable_compact_final_context_report(tmp_path) -> None:
+    """LLM mode should emit a second compact report with less repetition than the grouped summary."""
+    jsonl = tmp_path / "scene.jsonl"
+    txt = tmp_path / "scene.txt"
+    dispatcher = TelemetryDispatcher(
+        jsonl_path=jsonl,
+        text_path=txt,
+        scene_name="CompactScene",
+        output_mode="llm",
+    )
+    grouped_path = dispatcher.check_digest_path
+    compact_path = dispatcher.final_context_path
+    try:
+        for start, partner in ((0.0, "B"), (1.0, "C"), (2.0, "D")):
+            dispatcher.record_collision_event(
+                {
+                    "objects": [f'Text("Anchor").char[{int(start)}]', f'Text("{partner}").char[0]'],
+                    "start_time": start,
+                    "end_time": start + 0.5,
+                    "duration": 0.5,
+                    "peak_overlap_area": 0.1 + start,
+                    "peak_centroid": {"x": start, "y": start + 0.25},
+                    "resolution_mtv": {"x": 0.0, "y": 0.0, "z": 0.0},
+                    "fix_suggestion": "# noop",
+                }
+            )
+    finally:
+        dispatcher.close()
+
+    assert grouped_path is not None
+    assert compact_path is not None
+    grouped = json.loads(grouped_path.read_text(encoding="utf-8"))
+    compact = json.loads(compact_path.read_text(encoding="utf-8"))
+
+    assert compact["scene"] == "CompactScene"
+    assert compact["fmt"].startswith("v1")
+    assert compact["B"]
+    assert compact["O"]
+    assert compact["E"]
+    assert compact["G"]
+    assert len(json.dumps(compact)) < len(json.dumps(grouped))

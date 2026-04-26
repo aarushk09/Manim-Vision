@@ -22,6 +22,7 @@ from manim_vision.semantic import (
     per_pair_jsonl_enabled,
 )
 from manim_vision.solver.constraint import ConstraintSolver
+from manim_vision.overlay import serialize_overlap_geometry
 from manim_vision.telemetry.dispatcher import TelemetryDispatcher
 
 logger = logging.getLogger(__name__)
@@ -36,8 +37,10 @@ class ActiveCollisionEvent:
     latest_time: float
     peak_overlap_area: float
     peak_centroid: tuple[float, float]
+    peak_geometry: dict[str, Any]
     resolution_mtv: tuple[float, float, float]
     fix_suggestion: str
+    samples: list[dict[str, Any]]
 
 
 def _scene_time_seconds(scene: Any) -> float:
@@ -67,12 +70,14 @@ def _event_payload(event: ActiveCollisionEvent, *, end_time: float) -> dict[str,
             "x": float(event.peak_centroid[0]),
             "y": float(event.peak_centroid[1]),
         },
+        "peak_geometry": event.peak_geometry,
         "resolution_mtv": {
             "x": float(event.resolution_mtv[0]),
             "y": float(event.resolution_mtv[1]),
             "z": float(event.resolution_mtv[2]),
         },
         "fix_suggestion": event.fix_suggestion,
+        "samples": list(event.samples),
     }
 
 
@@ -190,23 +195,50 @@ def _execute_collision_check(scene: Any) -> None:
             )
 
             if event_key not in active_events:
+                geometry_payload = serialize_overlap_geometry(best.overlap_geometry)
                 active_events[event_key] = ActiveCollisionEvent(
                     objects=(label_a, label_b),
                     start_time=timestamp,
                     latest_time=timestamp,
                     peak_overlap_area=float(best.overlap_area),
                     peak_centroid=best.overlap_centroid,
+                    peak_geometry=geometry_payload,
                     resolution_mtv=mtv_tuple,
                     fix_suggestion=fix_syntax,
+                    samples=[
+                        {
+                            "time": float(timestamp),
+                            "area": float(best.overlap_area),
+                            "centroid": {
+                                "x": float(best.overlap_centroid[0]),
+                                "y": float(best.overlap_centroid[1]),
+                            },
+                            "geometry": geometry_payload,
+                        }
+                    ],
                 )
                 n_opened += 1
             else:
                 event = active_events[event_key]
                 event.latest_time = timestamp
                 event.objects = (label_a, label_b)
+                geometry_payload = serialize_overlap_geometry(best.overlap_geometry)
+                if not event.samples or float(event.samples[-1].get("time", -1.0)) != float(timestamp):
+                    event.samples.append(
+                        {
+                            "time": float(timestamp),
+                            "area": float(best.overlap_area),
+                            "centroid": {
+                                "x": float(best.overlap_centroid[0]),
+                                "y": float(best.overlap_centroid[1]),
+                            },
+                            "geometry": geometry_payload,
+                        }
+                    )
                 if float(best.overlap_area) >= float(event.peak_overlap_area):
                     event.peak_overlap_area = float(best.overlap_area)
                     event.peak_centroid = best.overlap_centroid
+                    event.peak_geometry = geometry_payload
                     event.resolution_mtv = mtv_tuple
                     event.fix_suggestion = fix_syntax
 

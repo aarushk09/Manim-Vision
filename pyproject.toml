@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "manim-vision"
-version = "0.1.7"
-description = "Manim Vision: spatial collision intelligence for Manim scenes, with LLM-friendly check digests and telemetry."
+version = "0.1.9"
+description = "Manim Vision: spatial collision intelligence for Manim scenes, with LLM-friendly check digests and telemetry. Maintenance: small bug fixes and minor polish."
 readme = "README.md"
 requires-python = ">=3.10,<3.13"
 license = { text = "MIT" }
