@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from contextlib import AbstractContextManager, nullcontext
 from dataclasses import dataclass
@@ -19,6 +20,15 @@ if TYPE_CHECKING:
     from manim.mobject.types.vectorized_mobject import VMobject
 
 logger = logging.getLogger(__name__)
+
+
+def _verbose_geometry_skips() -> bool:
+    """If true, log every skipped mobject at WARNING; default is DEBUG only."""
+    return os.environ.get("MANIM_VISION_VERBOSE_GEO", "").lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 @dataclass(frozen=True)
@@ -75,7 +85,10 @@ class PrecisionGeometryEngine:
             try:
                 geom = self._adapter.vmobject_to_polygon(mobject)
             except ManimVisionGeometryError as exc:
-                self._logger.warning("Skipping registration for %s: %s", mobject, exc)
+                if _verbose_geometry_skips():
+                    self._logger.warning("Skipping registration for %s: %s", mobject, exc)
+                else:
+                    self._logger.debug("Skipping registration for %s: %s", mobject, exc)
                 return
             self._registry[id(mobject)] = (mobject, geom)
 
@@ -95,7 +108,10 @@ class PrecisionGeometryEngine:
             try:
                 geom = self._adapter.vmobject_to_polygon(mobject)
             except ManimVisionGeometryError as exc:
-                self._logger.warning("Skipping geometry update for %s: %s", mobject, exc)
+                if _verbose_geometry_skips():
+                    self._logger.warning("Skipping geometry update for %s: %s", mobject, exc)
+                else:
+                    self._logger.debug("Skipping geometry update for %s: %s", mobject, exc)
                 return
             self._registry[key] = (mobject, geom)
 

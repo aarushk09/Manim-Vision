@@ -80,3 +80,6 @@ class ManimVision:
         executor = scene.__dict__.get("_self_executor")
         if executor is not None:
             executor.shutdown(wait=True)
+        dispatcher = scene.__dict__.get("_self_dispatcher")
+        if dispatcher is not None and hasattr(dispatcher, "close"):
+            dispatcher.close()

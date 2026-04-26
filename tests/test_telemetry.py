@@ -78,3 +78,19 @@ def test_fix_suggestion_is_string() -> None:
     dispatcher = TelemetryDispatcher(output_stream=buf, scene_name="FixScene")
     payload = dispatcher.dispatch(_sample_collision(), np.zeros(3), "shift(LEFT * 0.5000)")
     assert isinstance(payload["fix_suggestion"], str)
+
+
+def test_file_output_jsonl_and_human_txt(tmp_path) -> None:
+    """Default file mode must append one JSONL line and a text block, then close cleanly."""
+    jsonl = tmp_path / "e.jsonl"
+    txt = tmp_path / "e.txt"
+    dispatcher = TelemetryDispatcher(jsonl_path=jsonl, text_path=txt, scene_name="Embeddings")
+    try:
+        dispatcher.dispatch(_sample_collision(), np.array([0.0, 0.0, 0.0]), "# noop")
+    finally:
+        dispatcher.close()
+    line = jsonl.read_text(encoding="utf-8").strip()
+    assert json.loads(line)["scene_name"] == "Embeddings"
+    text_body = txt.read_text(encoding="utf-8")
+    assert "OVERLAP" in text_body
+    assert "entities:" in text_body

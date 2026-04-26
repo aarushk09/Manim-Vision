@@ -100,7 +100,14 @@ Internal pieces (for reading the code or building on top of the library):
 
 ## Telemetry output
 
-Each report is a **single JSON object** (pretty-printed with indentation in the default dispatcher) with fields such as:
+By default, each collision is **appended to two files** under your Manim **media** tree (see `config.media_dir`, often `./media`):
+
+- `media/manim_vision/<SceneName>_spatial.jsonl` — one **JSON object per line** (easy to process with tools or `jq`)
+- `media/manim_vision/<SceneName>_spatial_log.txt` — the same event as a **human-readable** block (timestamp, entities, overlap area, MTV, fix hint)
+
+Override the directory with `MANIM_VISION_REPORT_DIR`, or set `MANIM_VISION_REPORT_STDOUT=1` to also print pretty JSON to the terminal. When running tests or passing a custom `StringIO` to `TelemetryDispatcher`, the pretty JSON still goes to that stream only (no files).
+
+The payload fields are such as:
 
 - `timestamp` — ISO-8601 UTC
 - `scene_name` — Sanitized scene class name
@@ -110,9 +117,9 @@ Each report is a **single JSON object** (pretty-printed with indentation in the 
 - `resolution_mtv` — `x`, `y`, `z` components (2D analysis uses `z: 0`)
 - `fix_suggestion` — Suggested Manim code, often chained `shift(UP * …).shift(RIGHT * …)` style
 
-The contract is defined in code as `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision/telemetry/schema.py`. Invalid payloads raise `ManimVisionSchemaError`.
+The contract is defined in code as `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision/telemetry/schema.py`. Invalid payloads raise `ManimVisionSchemaError`. Report file handles are closed when you call `ManimVision.shutdown(self)` (or the scene’s `shutdown()`).
 
-To capture telemetry to a file when driving Manim headlessly, redirect **stdout** or construct a `TelemetryDispatcher(output_stream=...)` in advanced integrations (the default path used by the stock pipeline points at `sys.stdout`).
+**Geometry “skips” (Text with no points yet, empty `Mobject`, etc.)** are expected in many Manim scripts. They are logged at **DEBUG** by default so the console is not spammed. Set `MANIM_VISION_VERBOSE_GEO=1` if you need every skip at **WARNING** when debugging the adapter.
 
 ---
 

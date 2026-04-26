@@ -61,7 +61,7 @@ class GeometryAdapter:
             ring = self._project_2d(points)
             if self._all_points_coincident(ring):
                 msg = f"VMobject '{mobject}' degenerates to a single location."
-                logger.warning(msg)
+                logger.debug("%s", msg)
                 raise ManimVisionGeometryError(msg)
             geom = LineString(ring)
             return self._finalize_geometry(geom, precision_grid, mobject)
@@ -78,7 +78,7 @@ class GeometryAdapter:
                 continue
             if self._all_points_coincident(sub_arr):
                 msg = f"VMobject '{mobject}' contains a degenerate subpath; skipping it."
-                logger.warning(msg)
+                logger.debug("%s", msg)
                 continue
             sampled = self._discretize_subpath(sub_arr, degree, pixel_size)
             ring_2d = self._project_2d(sampled)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from manim import Circle, Square
+import logging
+
+import pytest
+from manim import Circle, Mobject, Square
 
 from manim_vision.geometry.engine import PrecisionGeometryEngine
 
@@ -72,3 +75,19 @@ def test_update_recalculates_geometry() -> None:
     b.shift([10.0, 0.0, 0.0])
     eng.update(b)
     assert eng.check_collisions() == []
+
+
+def test_register_empty_mobject_logs_debug_not_warning(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Mobjects with no stroke points (e.g. unlaid Text) should not flood WARNING-level logs."""
+    caplog.set_level(logging.DEBUG)
+    eng = PrecisionGeometryEngine()
+    eng.register(Mobject())
+    assert not any(
+        r.levelno == logging.WARNING and "Skipping registration" in r.getMessage()
+        for r in caplog.records
+    )
+    assert any(
+        r.levelno == logging.DEBUG and "Skipping registration" in r.getMessage() for r in caplog.records
+    )
