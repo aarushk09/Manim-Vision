@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
@@ -26,11 +27,11 @@ def _execute_collision_check(scene: Any) -> None:
     Args:
         scene: The instrumented scene or scene proxy carrying ManimVision runtime attributes.
     """
-    lock = scene.__dict__["_self_lock"]
-    engine = scene.__dict__["_self_engine"]
-    solver = scene.__dict__["_self_solver"]
-    dispatcher = scene.__dict__["_self_dispatcher"]
-    scene_name = scene.__dict__["_manim_vision_scene_class_name"]
+    lock = getattr(scene, "_self_lock")
+    engine = getattr(scene, "_self_engine")
+    solver = getattr(scene, "_self_solver")
+    dispatcher = getattr(scene, "_self_dispatcher")
+    scene_name = getattr(scene, "_manim_vision_scene_class_name")
 
     with lock:
         collision_results = engine.check_collisions()
@@ -51,7 +52,7 @@ def _submit_collision_check(scene: Any) -> None:
     Args:
         scene: Instrumented scene or proxy with ``_self_executor`` populated.
     """
-    executor: ThreadPoolExecutor = scene.__dict__["_self_executor"]
+    executor: ThreadPoolExecutor = getattr(scene, "_self_executor")
     executor.submit(scene._run_collision_check)
 
 
@@ -84,7 +85,7 @@ class ManimVisionSceneMixin:
 
     def add(self, *mobjects: Any) -> Any:
         """Register geometry proxies then delegate to Manim's ``Scene.add``."""
-        engine = self.__dict__["_self_engine"]
+        engine = self._self_engine
         for mob in mobjects:
             ManimVisionMobjectProxy(mob, engine)
         result = super().add(*mobjects)
@@ -93,7 +94,7 @@ class ManimVisionSceneMixin:
 
     def remove(self, *mobjects: Any) -> Any:
         """Deregister tracked mobjects then delegate to ``Scene.remove``."""
-        engine = self.__dict__["_self_engine"]
+        engine = self._self_engine
         for mob in mobjects:
             engine.deregister(mob)
         return super().remove(*mobjects)
@@ -118,7 +119,7 @@ class ManimVisionSceneMixin:
         Returns:
             None.
         """
-        executor: ThreadPoolExecutor | None = self.__dict__.get("_self_executor")
+        executor: ThreadPoolExecutor | None = getattr(self, "_self_executor", None)
         if executor is not None:
             executor.shutdown(wait=True)
 
@@ -131,11 +132,17 @@ class ManimVisionSceneProxy(wrapt.ObjectProxy):
         super().__init__(wrapped_scene)
         scene_name = type(wrapped_scene).__name__
         for key, value in _create_manim_vision_runtime_attrs(scene_name).items():
-            self.__dict__[key] = value
+            # Use wrapt's helper: plain ``object.__setattr__`` fails on ObjectProxy slottage;
+            # ``__setattr__`` would route non-``_self_`` names onto the wrapped scene.
+            self.__self_setattr__(key, value)
+
+    def __deepcopy__(self, clone_from_id: Any) -> Any:
+        """Deep-copy the wrapped scene only, omitting proxy state (lock, engine, etc.)."""
+        return copy.deepcopy(self.__wrapped__, clone_from_id)
 
     def add(self, *mobjects: Any) -> Any:
         """Wrap additions with geometry registration and schedule a collision check."""
-        engine = self.__dict__["_self_engine"]
+        engine = self._self_engine
         for mob in mobjects:
             ManimVisionMobjectProxy(mob, engine)
         result = self.__wrapped__.add(*mobjects)
@@ -144,7 +151,7 @@ class ManimVisionSceneProxy(wrapt.ObjectProxy):
 
     def remove(self, *mobjects: Any) -> Any:
         """Remove mobjects from the scene and registry."""
-        engine = self.__dict__["_self_engine"]
+        engine = self._self_engine
         for mob in mobjects:
             engine.deregister(mob)
         return self.__wrapped__.remove(*mobjects)
@@ -169,6 +176,6 @@ class ManimVisionSceneProxy(wrapt.ObjectProxy):
         Returns:
             None.
         """
-        executor: ThreadPoolExecutor | None = self.__dict__.get("_self_executor")
+        executor: ThreadPoolExecutor | None = getattr(self, "_self_executor", None)
         if executor is not None:
             executor.shutdown(wait=True)

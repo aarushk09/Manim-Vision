@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import threading
 import time
 from unittest.mock import MagicMock, patch
@@ -20,6 +21,25 @@ def test_isinstance_preserved() -> None:
     circle = Circle()
     proxy = ManimVisionMobjectProxy(circle, engine)
     assert isinstance(proxy, VMobject)
+
+
+def test_engine_not_stored_on_wrapped_mobject_dict() -> None:
+    """The geometry engine (and its lock) must not live on the underlying VMobject ``__dict__``."""
+    engine = PrecisionGeometryEngine()
+    circle = Circle()
+    ManimVisionMobjectProxy(circle, engine)
+    assert "_self_engine" not in circle.__dict__
+
+
+def test_proxy_deepcopy_does_not_fail_on_lock() -> None:
+    """``copy.deepcopy`` must not traverse a ``threading.Lock`` on the wrapped mobject."""
+    engine = PrecisionGeometryEngine()
+    circle = Circle()
+    proxy = ManimVisionMobjectProxy(circle, engine)
+    clone = copy.deepcopy(proxy)
+    assert not isinstance(clone, ManimVisionMobjectProxy)
+    assert isinstance(clone, VMobject)
+    assert "_self_engine" not in clone.__dict__
 
 
 def test_shift_triggers_engine_update() -> None:
@@ -47,7 +67,7 @@ def test_scene_add_wraps_mobject() -> None:
     try:
         c = Circle()
         proxy.add(c)
-        engine = proxy.__dict__["_self_engine"]
+        engine = proxy._self_engine
         assert id(c) in engine._registry
     finally:
         proxy.shutdown()
@@ -60,7 +80,7 @@ def test_scene_remove_deregisters() -> None:
     try:
         c = Circle()
         proxy.add(c)
-        engine = proxy.__dict__["_self_engine"]
+        engine = proxy._self_engine
         proxy.remove(c)
         assert id(c) not in engine._registry
     finally:

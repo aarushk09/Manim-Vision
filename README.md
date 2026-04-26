@@ -142,6 +142,7 @@ To capture telemetry to a file when driving Manim headlessly, redirect **stdout*
 - **Touches vs overlap**: pairs that only **touch** (zero area) are filtered out; positive **overlap area** is what triggers a report.
 - **Heavier geometry** (e.g. concave shapes) may use **centroid / convex-hull fallbacks** in the solver; see `ConstraintSolver` docstrings and implementation for details.
 - The library aims to be **non-invasive**: it does not replace your `self` reference; it only replaces the runtime class of the scene object to install hooks.
+- **Manim’s `copy.deepcopy` and helpers** (used when building many animations) walk each mobject’s `__dict__`. Internals that hold a `threading.Lock` (e.g. the geometry engine) must **not** be stored on the underlying VMobject. Manim Vision keeps that state on the **wrapt proxy** and implements `__deepcopy__` on `ManimVisionMobjectProxy` / `ManimVisionSceneProxy` so creation-style animations (`FadeIn`, `Transform`, etc.) do not fail with `TypeError: cannot pickle '_thread.lock' object`.
 
 ---
 

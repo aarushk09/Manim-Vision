@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import logging
 from typing import Any, Callable
 
@@ -45,8 +46,15 @@ class ManimVisionMobjectProxy(wrapt.ObjectProxy):
             engine: Owning :class:`~manim_vision.geometry.engine.PrecisionGeometryEngine`.
         """
         super().__init__(wrapped)
-        self.__dict__["_self_engine"] = engine
+        # Must not assign via ``self.__dict__``: ObjectProxy's ``__dict__`` is the
+        # wrapped mobject, so a lock-carrying engine in that dict breaks Manim's
+        # ``Mobject.__deepcopy__`` during animation setup. Store only on the proxy.
+        self._self_engine = engine
         engine.register(wrapped)
+
+    def __deepcopy__(self, clone_from_id: Any) -> Any:
+        """Deep-copy only the wrapped mobject, omitting proxy and engine (which holds locks)."""
+        return copy.deepcopy(self.__wrapped__, clone_from_id)
 
     def __getattr__(self, name: str) -> Any:
         """Resolve attributes on the wrapped object, intercepting spatial mutators."""
@@ -60,7 +68,7 @@ class ManimVisionMobjectProxy(wrapt.ObjectProxy):
 
         def intercepted(*args: Any, **kwargs: Any) -> Any:
             result = method(*args, **kwargs)
-            engine = self.__dict__["_self_engine"]
+            engine = self._self_engine
             engine.update(self.__wrapped__)
             return result
 
