@@ -80,6 +80,21 @@ def test_fix_suggestion_is_string() -> None:
     assert isinstance(payload["fix_suggestion"], str)
 
 
+def test_session_dedupe_skips_second_identical_pair(tmp_path) -> None:
+    """Same semantic pair must not write two JSONL lines in one session."""
+    jsonl = tmp_path / "d.jsonl"
+    txt = tmp_path / "d.txt"
+    dispatcher = TelemetryDispatcher(jsonl_path=jsonl, text_path=txt, scene_name="S")
+    try:
+        a = dispatcher.dispatch(_sample_collision(), np.array([0.0, 0.0, 0.0]), "# a", entity_labels=("A", "B"))
+        b = dispatcher.dispatch(_sample_collision(), np.array([0.0, 0.0, 0.0]), "# b", entity_labels=("A", "B"))
+        assert a is not None
+        assert b is None
+        assert len(jsonl.read_text().strip().splitlines()) == 1
+    finally:
+        dispatcher.close()
+
+
 def test_file_output_jsonl_and_human_txt(tmp_path) -> None:
     """Default file mode must append one JSONL line and a text block, then close cleanly."""
     jsonl = tmp_path / "e.jsonl"

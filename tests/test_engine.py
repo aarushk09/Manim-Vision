@@ -5,9 +5,10 @@ from __future__ import annotations
 import logging
 
 import pytest
-from manim import Circle, Mobject, Square
+from manim import RIGHT, Circle, Mobject, Square, VGroup
 
 from manim_vision.geometry.engine import PrecisionGeometryEngine
+from manim_vision.geometry.registration import register_mobject_families_in_engine
 
 
 def test_no_collision_on_separated_objects() -> None:
@@ -75,6 +76,19 @@ def test_update_recalculates_geometry() -> None:
     b.shift([10.0, 0.0, 0.0])
     eng.update(b)
     assert eng.check_collisions() == []
+
+
+def test_vgroup_family_registers_submobjects_and_detects_overlap() -> None:
+    """Each VMobject in a :class:`VGroup` must be a separate Shapely entry for ST queries."""
+    eng = PrecisionGeometryEngine()
+    a = Square(side_length=0.4)
+    b = Square(side_length=0.4)
+    b.next_to(a, RIGHT, buff=-0.15)
+    g = VGroup(a, b)
+    register_mobject_families_in_engine(g, eng)
+    assert id(a) in eng._registry and id(b) in eng._registry
+    hits = eng.check_collisions()
+    assert len(hits) >= 1
 
 
 def test_register_empty_mobject_logs_debug_not_warning(

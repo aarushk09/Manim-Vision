@@ -15,6 +15,7 @@ from jsonschema import ValidationError, validate
 from manim_vision.exceptions import ManimVisionSchemaError
 from manim_vision.telemetry.paths import default_report_paths
 from manim_vision.telemetry.schema import MANIM_VISION_SPATIAL_REPORT_SCHEMA
+from manim_vision.semantic import stable_pair_key, session_dedupe_enabled
 
 logger = logging.getLogger("manim_vision.telemetry")
 
@@ -67,6 +68,8 @@ class TelemetryDispatcher:
         self._txt_path: Path | None = None
         if output_stream is not None:
             self._json_stream: TextIO = output_stream
+            self._session_dedupe = False
+            self._dedupe_keys: set[str] = set()
             return
 
         d_json, d_txt = default_report_paths(scene_name)
@@ -91,6 +94,8 @@ class TelemetryDispatcher:
                 "true",
                 "yes",
             )
+        self._session_dedupe = self._owns and session_dedupe_enabled()
+        self._dedupe_keys: set[str] = set()
 
     @property
     def report_jsonl_path(self) -> Path | None:
@@ -121,17 +126,23 @@ class TelemetryDispatcher:
         fix_syntax: str,
         *,
         scene_name: str | None = None,
-    ) -> dict[str, Any]:
+        entity_labels: tuple[str, str] | None = None,
+    ) -> dict[str, Any] | None:
         """Build, validate, and dispatch a Spatial Health Report.
+
+        When ``self._session_dedupe`` is active (default for file output), a pair
+        of ``entity_labels`` that was already written in this render is skipped
+        and ``None`` is returned.
 
         Args:
             collision_result: A :class:`~manim_vision.geometry.engine.CollisionResult` instance.
             mtv: Iterable MTV components (length at least two).
             fix_syntax: Manim ``shift`` chain or comment string.
             scene_name: Optional override for the reporting scene name.
+            entity_labels: Human-scale ``(a, b)`` strings for ``colliding_entities``; default is raw mobject names.
 
         Returns:
-            The validated payload dictionary.
+            The validated payload dictionary, or ``None`` if de-duplicated.
 
         Raises:
             ManimVisionSchemaError: If the payload fails JSON Schema validation.
@@ -144,6 +155,15 @@ class TelemetryDispatcher:
             name = "UnknownScene"
         display_name = name
 
+        ent_a, ent_b = (
+            (entity_labels[0], entity_labels[1])
+            if entity_labels is not None
+            else (collision_result.mobject_a_name, collision_result.mobject_b_name)
+        )
+        pair_key = stable_pair_key(ent_a, ent_b)
+        if self._session_dedupe and pair_key in self._dedupe_keys:
+            return None
+
         payload = {
             "timestamp": datetime.datetime.now(datetime.timezone.utc)
             .replace(microsecond=0)
@@ -151,10 +171,7 @@ class TelemetryDispatcher:
             .replace("+00:00", "Z"),
             "scene_name": name,
             "error_type": "OVERLAP",
-            "colliding_entities": [
-                collision_result.mobject_a_name,
-                collision_result.mobject_b_name,
-            ],
+            "colliding_entities": [ent_a, ent_b],
             "overlap_area": float(collision_result.overlap_area),
             "resolution_mtv": {
                 "x": float(mtv[0]),
@@ -170,6 +187,8 @@ class TelemetryDispatcher:
             raise ManimVisionSchemaError(
                 f"Generated telemetry payload failed schema validation: {exc.message}"
             ) from exc
+        if self._session_dedupe:
+            self._dedupe_keys.add(pair_key)
 
         if self._owns:
             line = json.dumps(

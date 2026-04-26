@@ -10,8 +10,16 @@ from typing import Any
 
 import wrapt
 
-from manim_vision.geometry.engine import PrecisionGeometryEngine
-from manim_vision.proxy.mobject_proxy import ManimVisionMobjectProxy
+from manim_vision.geometry.engine import CollisionResult, PrecisionGeometryEngine
+from manim_vision.geometry.registration import (
+    deregister_mobject_families_from_engine,
+    register_mobject_families_in_engine,
+)
+from manim_vision.semantic import (
+    is_pair_internal_glyphs_same_text,
+    min_reportable_overlap_area,
+    semantic_label,
+)
 from manim_vision.solver.constraint import ConstraintSolver
 from manim_vision.telemetry.dispatcher import TelemetryDispatcher
 
@@ -34,16 +42,70 @@ def _execute_collision_check(scene: Any) -> None:
     scene_name = getattr(scene, "_manim_vision_scene_class_name")
 
     with lock:
-        collision_results = engine.check_collisions()
-        if not collision_results:
+        # Animations only move submobject points; scene.mobjects’ families must be
+        # re-baked to Shapely before testing pairs.
+        engine.resync_scene_mobjects(list(scene.mobjects))
+        raw_hits = engine.check_collisions()
+        if not raw_hits:
             return
 
-        solver.apply_force_relaxation(collision_results)
+        min_a = min_reportable_overlap_area()
+        filtered: list[CollisionResult] = []
+        n_tiny = 0
+        n_glyphs = 0
+        for cr in raw_hits:
+            if cr.overlap_area < min_a:
+                n_tiny += 1
+                continue
+            m_a = engine._registry[cr.mobject_a_id][0]
+            m_b = engine._registry[cr.mobject_b_id][0]
+            if is_pair_internal_glyphs_same_text(m_a, m_b, scene):
+                n_glyphs += 1
+                continue
+            filtered.append(cr)
 
-        for cr in collision_results:
+        if not filtered:
+            return
+
+        solver.apply_force_relaxation(filtered)
+
+        n_new = 0
+        n_duped = 0
+        for cr in filtered:
+            m_a = engine._registry[cr.mobject_a_id][0]
+            m_b = engine._registry[cr.mobject_b_id][0]
             mtv = solver.calculate_mtv(cr)
             fix_syntax = solver.generate_fix_syntax(mtv)
-            dispatcher.dispatch(cr, mtv, fix_syntax, scene_name=scene_name)
+            labels = (semantic_label(m_a, scene), semantic_label(m_b, scene))
+            out = dispatcher.dispatch(
+                cr,
+                mtv,
+                fix_syntax,
+                scene_name=scene_name,
+                entity_labels=labels,
+            )
+            if out is None:
+                n_duped += 1
+            else:
+                n_new += 1
+
+        if n_new:
+            logger.info(
+                "Manim Vision: %d new unique overlap report(s) for scene %s (check had %d raw, "
+                "%d below min area, %d same-text internal, %d duplicate vs earlier in session).",
+                n_new,
+                scene_name,
+                len(raw_hits),
+                n_tiny,
+                n_glyphs,
+                n_duped,
+            )
+        elif filtered:
+            logger.debug(
+                "Manim Vision: 0 new reports (all %d pair(s) already in session) for %s",
+                n_duped,
+                scene_name,
+            )
 
 
 def _submit_collision_check(scene: Any) -> None:
@@ -65,7 +127,7 @@ def _create_manim_vision_runtime_attrs(scene_name: str) -> dict[str, Any]:
     Returns:
         Mapping of attribute names to values for ``__dict__`` / ``object.__setattr__``.
     """
-    lock = threading.Lock()
+    lock = threading.RLock()
     engine = PrecisionGeometryEngine(registry_lock=lock)
     solver = ConstraintSolver()
     dispatcher = TelemetryDispatcher(scene_name=scene_name)
@@ -84,19 +146,19 @@ class ManimVisionSceneMixin:
     """Mixin merged ahead of the user's ``Scene`` subclass by :meth:`manim_vision.core.ManimVision.monitor`."""
 
     def add(self, *mobjects: Any) -> Any:
-        """Register geometry proxies then delegate to Manim's ``Scene.add``."""
+        """Register geometry for every :class:`VMobject` in each added mobject’s family."""
         engine = self._self_engine
         for mob in mobjects:
-            ManimVisionMobjectProxy(mob, engine)
+            register_mobject_families_in_engine(mob, engine)
         result = super().add(*mobjects)
         _submit_collision_check(self)
         return result
 
     def remove(self, *mobjects: Any) -> Any:
-        """Deregister tracked mobjects then delegate to ``Scene.remove``."""
+        """Deregister all family VMobjects then delegate to ``Scene.remove``."""
         engine = self._self_engine
         for mob in mobjects:
-            engine.deregister(mob)
+            deregister_mobject_families_from_engine(mob, engine)
         return super().remove(*mobjects)
 
     def play(self, *animations: Any, **kwargs: Any) -> Any:
@@ -147,7 +209,7 @@ class ManimVisionSceneProxy(wrapt.ObjectProxy):
         """Wrap additions with geometry registration and schedule a collision check."""
         engine = self._self_engine
         for mob in mobjects:
-            ManimVisionMobjectProxy(mob, engine)
+            register_mobject_families_in_engine(mob, engine)
         result = self.__wrapped__.add(*mobjects)
         _submit_collision_check(self)
         return result
@@ -156,7 +218,7 @@ class ManimVisionSceneProxy(wrapt.ObjectProxy):
         """Remove mobjects from the scene and registry."""
         engine = self._self_engine
         for mob in mobjects:
-            engine.deregister(mob)
+            deregister_mobject_families_from_engine(mob, engine)
         return self.__wrapped__.remove(*mobjects)
 
     def play(self, *animations: Any, **kwargs: Any) -> Any:

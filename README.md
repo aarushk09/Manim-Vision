@@ -28,7 +28,8 @@
 ## What it does
 
 - **Hooks** your live `Scene` so **`add`**, **`play`**, and **`remove`** participate in a collision pipeline (via a dynamically merged mixin; your scene class is unchanged at import time).
-- **Wraps** added `VMobject`s with a transparent proxy that refreshes stored geometry when you call common **spatial** methods (`shift`, `scale`, `rotate`, `move_to`, `next_to`, `align_to`, `set_x` / `set_y` / `set_z`, `stretch`, `apply_matrix`, `apply_function`).
+- **Tracks every visible leaf** `VMobject` in the **mobject family** of each `add()` call (e.g. each `Square` and `Text` inside a `VGroup` — not only the group’s root), then refreshes that geometry from live point data after each **`play`**, so overlaps between siblings (arrow vs cell, two boxes, label vs shape, …) are seen by the 2D engine.
+- **Wraps** each *root* mobject in `add` with a transparent **proxy** that refreshes stored geometry when you call common **spatial** methods on the root only (`shift`, `scale`, `rotate`, `move_to`, `next_to`, `align_to`, `set_x` / `set_y` / `set_z`, `stretch`, `apply_matrix`, `apply_function`); submobject motion is still captured in the per-`play` resync.
 - **Detects** pairwise overlaps using **Shapely** (narrow phase, with DE-9IM / intersection area) on top of a **Shapely STRtree** for broad phase.
 - **Relaxes** overlapping pairs with an internal **force-based iteration** and computes **MTV-style** separation hints (`ConstraintSolver`).
 - **Emits** one **validated JSON** document per collision to **stdout** by default (JSON Schema: `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision.telemetry.schema`).
@@ -120,6 +121,14 @@ The payload fields are such as:
 The contract is defined in code as `MANIM_VISION_SPATIAL_REPORT_SCHEMA` in `manim_vision/telemetry/schema.py`. Invalid payloads raise `ManimVisionSchemaError`. Report file handles are closed when you call `ManimVision.shutdown(self)` (or the scene’s `shutdown()`).
 
 **Geometry “skips” (Text with no points yet, empty `Mobject`, etc.)** are expected in many Manim scripts. They are logged at **DEBUG** by default so the console is not spammed. Set `MANIM_VISION_VERBOSE_GEO=1` if you need every skip at **WARNING** when debugging the adapter.
+
+**Readable volume (LLM- and log-friendly):**
+
+- **Session deduplication** (default, file output only): the same *semantic* pair of entities is written **once per render**; later `play` calls that still overlap do not append more JSONL lines. Disable with `MANIM_VISION_DISABLE_SESSION_DEDUPE=1`.
+- **Minimum overlap area** — `MANIM_VISION_MIN_OVERLAP_AREA` (default `0.0001` world units²) drops dust-sized intersections from SVG/anti-aliasing.
+- **Same-Text kerning** — adjacent glyph path overlaps *inside* one `Text` / `MathTex` string are ignored (not layout errors).
+- **Entity names** in reports are **broad** where possible, e.g. `Text("Binary Search")#…` or `VGroup#…`, not per-glyph `VMobjectFromSVGPath_…` ids.
+- The terminal prints **at most one** INFO line per `play` when there are **new** unique report rows, plus short counts; repeated overlaps that are only deduplicates log at **DEBUG** only.
 
 ---
 

@@ -53,7 +53,7 @@ def _mobject_label(mobject: VMobject) -> str:
 class PrecisionGeometryEngine:
     """Maintains Shapely geometries for VMobjects and answers overlap queries."""
 
-    def __init__(self, registry_lock: threading.Lock | None = None) -> None:
+    def __init__(self, registry_lock: threading.RLock | threading.Lock | None = None) -> None:
         """Create an engine with a dedicated adapter and logger.
 
         Args:
@@ -126,6 +126,26 @@ class PrecisionGeometryEngine:
         """
         with self._registry_guard():
             self._registry.pop(id(mobject), None)
+
+    def resync_scene_mobjects(self, scene_roots: list) -> None:
+        """Re-register or update geometry for all family VMobjects under the scene’s roots.
+
+        After :meth:`Scene.play`, only submobject geometry is updated, so we refresh every
+        tracked and newly drawable leaf before :meth:`check_collisions` runs. Uses the
+        registry re-entrantly; the scene’s lock should be a :class:`threading.RLock` so
+        :meth:`update` / :meth:`register` can be called from the same thread while the
+        worker holds the main scene lock.
+        """
+        from manim.mobject.types.vectorized_mobject import VMobject
+
+        for root in list(scene_roots):
+            for m in root.get_family():
+                if not isinstance(m, VMobject):
+                    continue
+                if id(m) in self._registry:
+                    self.update(m)
+                else:
+                    self.register(m)
 
     def check_collisions(self) -> list[CollisionResult]:
         """Run broad-phase STRtree queries and narrow-phase DE-9IM-backed overlap tests.
